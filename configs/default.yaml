@@ -1,0 +1,162 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# clusterAnalysis default configuration
+#
+# All file paths are relative to the humanLISBET-paper/ directory
+# (the parent of clusterAnalysis/).
+# Absolute paths are also accepted.
+# ─────────────────────────────────────────────────────────────────────────────
+
+data:
+  # Frame-level cluster assignments (output of behavior_clustering pipeline)
+  cluster_mapping: /srv/beegfs/scratch/shares/schaerm/schaer2/video_sam2_pose/humanLISBET-paper/post_training/behavior_clustering/results/sweep_birch_thr_2.8/mapping_cluster_frame_train.csv
+
+  # Per-segment cluster summary (dominant cluster, diversity metrics)
+  cross_video_train: /srv/beegfs/scratch/shares/schaerm/schaer2/video_sam2_pose/humanLISBET-paper/post_training/behavior_clustering/results/sweep_birch_thr_2.8/cross_video_train.csv
+
+  # Clinical metadata CSV (uuid, code, diagnosis, ADOS, MSEL, Vineland, ...)
+  clinical_csv: /srv/beegfs/scratch/shares/schaerm/schaer2/video_sam2_pose/humanLISBET-paper/dataset/info/child_for_humanlisbet_paper_with_paths_020326.csv
+
+  # Expert behavioral annotations CSV (code, behavior, start, stop, status, ...)
+  annotations_csv: /srv/beegfs/scratch/shares/schaerm/schaer2/video_sam2_pose/humanLISBET-paper/dataset/info/merged_annotations_with_duration.csv
+
+  # Root of pose record directories (each subdir = results_skeleton_{subject_session})
+  pose_records_dir: /srv/beegfs/scratch/shares/schaerm/schaer2/video_sam2_pose/humanLISBET-paper/dataset/pose_records
+
+  # Root of LISBET embedding directories (each subdir = one segment)
+  embeddings_dir: /home/shares/schaerm/schaer2/thibaut/humanlisbet/output/full_train/embeddings/models/hlis-gr-w1200-o600-L8-H8-E128-FF512-auggeom-embedder/embeddings/train
+
+  # Video frame rate (used to convert annotation times in seconds to frame indices)
+  fps: 20
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analyses: set to false to skip a section
+# ─────────────────────────────────────────────────────────────────────────────
+analyses:
+  # Cluster distribution during annotations (V-records only, 3 label levels)
+  annotation_overlap: true
+
+  # 128D annotation centroids per label + cluster labeling
+  # Centroids use global embeddings (all subjects); computed for all 3 label levels
+  annotation_centroids: true
+
+  # Cluster prevalence ~ clinical metrics (ASD vs TD + continuous scores)
+  clinical_correlations: true
+
+  # Per-cluster kinematic profiles (segment-level aggregates)
+  kinematic_profiles: true
+
+  # Per-cluster kinematic profiles at FRAME level (more accurate, slower)
+  kinematic_frame_analysis: true
+
+  # Frame-level kinematic profile per annotation label (all 3 levels)
+  annotation_kinematics: true
+
+  # 128D embedding dims × kinematic metrics (segment-level Spearman)
+  embedding_kinematics: true
+
+  # V-record vs non-V kinematic comparison (subset of kinematic_profiles)
+  vsubset_consistency: true
+
+  # Synthesize all analyses into per-cluster profile CSV + updated cluster report
+  cluster_profiles: true
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Annotation settings
+# ─────────────────────────────────────────────────────────────────────────────
+annotation:
+  # Minimum annotated frames for a label to be included at each level
+  min_frames_level1: 10   # behavior only
+  min_frames_level2: 5    # behavior + behavioral_category
+  min_frames_level3: 3    # behavior + behavioral_category + modifier_1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kinematics settings
+# ─────────────────────────────────────────────────────────────────────────────
+kinematics:
+  # true  → use normalized metrics (divided by trunk height; recommended)
+  # false → use raw 2D pixel-space values
+  use_normalized: true
+
+  # Subset of metrics to load. Set to null to load all ~65 metrics.
+  metrics: null
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Clinical metrics to analyze
+# ─────────────────────────────────────────────────────────────────────────────
+clinical:
+  # Columns for binary group comparisons (must have exactly 2 unique non-NaN values)
+  binary_groups:
+    - diagnosis          # ASD vs TD
+
+  # Continuous metrics for Spearman correlation (all confirmed present in CSV)
+  continuous:
+    - ADOS_G_ADOS_2_TOTAL_score_de_severite         # ADOS total severity score
+    - ADOS_2_ADOS_G_REVISED_SA_SEVERITY_SCORE       # Social affect severity
+    - ADOS_2_ADOS_G_REVISED_RRB_SEVERITY_SCORE_new  # Restricted/repetitive behavior severity
+    - ADOS_2_TOTAL                                  # Raw ADOS total
+    - ADOS_2_SOCIAL_AFECT_TOTAL                     # Social affect raw total
+    - VLDII_AdSS                                    # Vineland Adaptive Behavior composite
+    - VLDII_MotorSS                                 # Vineland Motor composite
+    - VLDII_gmsVS                                   # Vineland Gross Motor
+    - VLDII_fmsVS                                   # Vineland Fine Motor
+    - VLDII_SocSS                                   # Vineland Socialization composite
+    - VLDII_intVS                                   # Vineland Interpersonal
+    - VLDII_plaVS                                   # Vineland Play & Leisure
+    - VLDII_copVS                                   # Vineland Coping skills
+    - VLDII_DaiSS                                   # Vineland Daily Living composite
+    - VLDII_perVS                                   # Vineland Personal daily living
+    - VLDII_comVS                                   # Vineland Community daily living
+    - VLDII_domVS                                   # Vineland Domestic
+    - VLDII_ComSS                                   # Vineland Communication composite
+    - VLDII_expVS                                   # Vineland Expressive language
+    - VLDII_recVS                                   # Vineland Receptive language
+    - MSEL_TOTAL_DQ                                 # Mullen total DQ
+    - MSEL_FM_DQ                                    # Mullen Fine Motor DQ
+    - MSEL_VR_DQ                                    # Mullen Visual Reception DQ
+    - MSEL_LR_DQ                                    # Mullen Language Reception DQ
+    - MSEL_LE_DQ                                    # Mullen Language Expression DQ
+    - MSEL_NV_DQ                                    # Mullen Nonverbal DQ
+    - MSEL_V_DQ                                     # Mullen Verbal DQ
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Statistical parameters
+# ─────────────────────────────────────────────────────────────────────────────
+statistics:
+  # FDR correction method: "bh" (Benjamini-Hochberg) or "bonferroni"
+  fdr_method: bh
+
+  # Significance threshold (applied after FDR correction)
+  alpha: 0.05
+
+  # Clusters with fewer total frames than this threshold are flagged in reports
+  min_frames_per_cluster: 100
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Output settings
+# ─────────────────────────────────────────────────────────────────────────────
+output:
+  # Name of the output subdirectory under results_dir
+  run_name: default
+
+  # Root output directory
+  results_dir: /srv/beegfs/scratch/shares/schaerm/schaer2/video_sam2_pose/humanLISBET-paper/clusterAnalysis/results
+
+  # Whether to save intermediate and result DataFrames as .csv files
+  save_data: true
+
+  # Whether to generate and save figures
+  save_plots: true
+
+  # Figure formats to save (any subset of: png, pdf, svg)
+  plot_formats:
+    - png
+    - pdf
+
+  # Figure resolution in dots per inch
+  figure_dpi: 300
