@@ -88,12 +88,17 @@ where:
 
 ## Annotation Centroids and Global Cluster Centroids
 
-For each behavior type, the **annotation centroid** is the mean 128-D LISBET embedding
-vector across all frames where that behavior is annotated (V-records only):
+For each behavior type, the **annotation centroid** is event-weighted: first compute
+one mean 128-D LISBET embedding per annotated event, then average those event means
+(V-records only):
 
 ```
-centroid(B) = mean( embedding[frame] for all frames where behavior B is annotated )
+event_mean(e) = mean( embedding[frame] for frames in event e )
+centroid(B) = mean( event_mean(e) for events e with behavior B )
 ```
+
+This matches the bootstrap resampling unit (events), preventing weighting mismatch
+between point estimates and confidence intervals.
 
 **Global cluster centroids** are computed from **all subjects** (not just V-records),
 loading all available segment embeddings from `embeddings_dir`:

@@ -37,12 +37,22 @@ _ALLOWED_KEYS: dict[str, set[str]] = {
         "embedding_kinematics",
         "vsubset_consistency",
         "cluster_profiles",
+        "annotation_overlap_significance",
+        "annotation_centroids_significance",
     },
-    "annotation": {"min_frames_level1", "min_frames_level2", "min_frames_level3"},
+    "annotation": {"min_frames_level1", "min_frames_level2", "min_frames_level3", "distance_metric"},
     "kinematics": {"use_normalized", "metrics"},
     "clinical": {"binary_groups", "continuous"},
-    "statistics": {"fdr_method", "alpha", "min_frames_per_cluster"},
+    "statistics": {"fdr_method", "alpha", "min_frames_per_cluster", "significance"},
     "output": {"run_name", "results_dir", "save_plots", "save_data", "plot_formats", "figure_dpi"},
+}
+
+_ALLOWED_SIGNIFICANCE_KEYS = {
+    "n_permutations",
+    "n_bootstrap",
+    "seed",
+    "min_events_per_label",
+    "n_jobs",
 }
 
 _REQUIRED_DATA_KEYS = {
@@ -77,6 +87,11 @@ class AnalysesConfig:
     embedding_kinematics: bool = True
     vsubset_consistency: bool = True
     cluster_profiles: bool = True
+    annotation_overlap_significance: bool = True
+    annotation_centroids_significance: bool = True
+
+
+_VALID_DISTANCE_METRICS = {"euclidean", "cosine", "mahalanobis"}
 
 
 @dataclass
@@ -84,6 +99,7 @@ class AnnotationConfig:
     min_frames_level1: int = 10  # behavior only
     min_frames_level2: int = 5   # behavior + behavioral_category
     min_frames_level3: int = 3   # behavior + behavioral_category + modifier_1
+    distance_metric: str = "euclidean"  # euclidean | cosine | mahalanobis
 
 
 @dataclass
@@ -107,10 +123,20 @@ class ClinicalConfig:
 
 
 @dataclass
+class SignificanceConfig:
+    n_permutations: int = 1000      # permutations for enrichment test
+    n_bootstrap: int = 500          # bootstrap resamples for centroid CI
+    seed: int = 42                  # random seed for reproducibility
+    min_events_per_label: int = 5   # skip behaviors with fewer events
+    n_jobs: int = 1                 # reserved for future parallelization
+
+
+@dataclass
 class StatisticsConfig:
     fdr_method: str = "bh"
     alpha: float = 0.05
     min_frames_per_cluster: int = 100
+    significance: SignificanceConfig = field(default_factory=SignificanceConfig)
 
 
 @dataclass
@@ -183,6 +209,15 @@ def load_config(path: str | Path) -> ClusterAnalysisConfig:
                 f"Unknown keys in config section '{section}': {sorted(unknown)}"
             )
 
+    # Validate nested statistics.significance sub-keys
+    sig_raw_check = raw.get("statistics", {}).get("significance", {})
+    if isinstance(sig_raw_check, dict):
+        unknown_sig = set(sig_raw_check.keys()) - _ALLOWED_SIGNIFICANCE_KEYS
+        if unknown_sig:
+            raise ValueError(
+                f"Unknown keys in config section 'statistics.significance': {sorted(unknown_sig)}"
+            )
+
     # ── Parse each section ───────────────────────────────────────────────────
     data_raw = raw.get("data", {})
 
@@ -214,13 +249,26 @@ def load_config(path: str | Path) -> ClusterAnalysisConfig:
         embedding_kinematics=bool(analyses_raw.get("embedding_kinematics", True)),
         vsubset_consistency=bool(analyses_raw.get("vsubset_consistency", True)),
         cluster_profiles=bool(analyses_raw.get("cluster_profiles", True)),
+        annotation_overlap_significance=bool(
+            analyses_raw.get("annotation_overlap_significance", True)
+        ),
+        annotation_centroids_significance=bool(
+            analyses_raw.get("annotation_centroids_significance", True)
+        ),
     )
 
     ann_raw = raw.get("annotation", {})
+    distance_metric = str(ann_raw.get("distance_metric", "euclidean"))
+    if distance_metric not in _VALID_DISTANCE_METRICS:
+        raise ValueError(
+            f"Invalid annotation.distance_metric '{distance_metric}'. "
+            f"Choose from: {sorted(_VALID_DISTANCE_METRICS)}"
+        )
     ann_cfg = AnnotationConfig(
         min_frames_level1=int(ann_raw.get("min_frames_level1", 10)),
         min_frames_level2=int(ann_raw.get("min_frames_level2", 5)),
         min_frames_level3=int(ann_raw.get("min_frames_level3", 3)),
+        distance_metric=distance_metric,
     )
 
     kin_raw = raw.get("kinematics", {})
@@ -236,10 +284,19 @@ def load_config(path: str | Path) -> ClusterAnalysisConfig:
     )
 
     stat_raw = raw.get("statistics", {})
+    sig_raw = stat_raw.get("significance", {}) if isinstance(stat_raw.get("significance"), dict) else {}
+    sig_cfg = SignificanceConfig(
+        n_permutations=int(sig_raw.get("n_permutations", 1000)),
+        n_bootstrap=int(sig_raw.get("n_bootstrap", 500)),
+        seed=int(sig_raw.get("seed", 42)),
+        min_events_per_label=int(sig_raw.get("min_events_per_label", 3)),
+        n_jobs=int(sig_raw.get("n_jobs", 1)),
+    )
     stat_cfg = StatisticsConfig(
         fdr_method=str(stat_raw.get("fdr_method", "bh")),
         alpha=float(stat_raw.get("alpha", 0.05)),
         min_frames_per_cluster=int(stat_raw.get("min_frames_per_cluster", 100)),
+        significance=sig_cfg,
     )
 
     out_raw = raw.get("output", {})

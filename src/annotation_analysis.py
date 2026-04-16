@@ -206,6 +206,317 @@ def run_annotation_overlap(
 
 # ── Annotation centroids + cluster labeling ──────────────────────────────────
 
+# ── Distance helpers ──────────────────────────────────────────────────────────
+
+def _compute_pairwise_distances(
+    centroids_a: dict[str, np.ndarray],
+    centroids_b: dict[int, np.ndarray],
+    distance_metric: str = "euclidean",
+    cov_inv: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """
+    Compute a (behavior × cluster) distance matrix.
+
+    Parameters
+    ----------
+    centroids_a : dict mapping label → centroid vector (128D)
+    centroids_b : dict mapping cluster_id (int) → centroid vector (128D)
+    distance_metric : "euclidean" | "cosine" | "mahalanobis"
+    cov_inv : np.ndarray, shape (128, 128) | None
+        Inverse covariance matrix required for Mahalanobis. Must be provided
+        when distance_metric == "mahalanobis".
+
+    Returns
+    -------
+    pd.DataFrame of shape (n_behaviors, n_clusters), float32.
+    """
+    behaviors = sorted(centroids_a.keys())
+    cluster_ids = sorted(centroids_b.keys())
+    dist_data = np.zeros((len(behaviors), len(cluster_ids)), dtype=np.float32)
+
+    if distance_metric == "euclidean":
+        for i, b in enumerate(behaviors):
+            a_vec = centroids_a[b].astype(np.float64)
+            for j, cid in enumerate(cluster_ids):
+                diff = a_vec - centroids_b[cid].astype(np.float64)
+                dist_data[i, j] = float(np.linalg.norm(diff))
+
+    elif distance_metric == "cosine":
+        for i, b in enumerate(behaviors):
+            a_vec = centroids_a[b].astype(np.float64)
+            norm_a = np.linalg.norm(a_vec)
+            for j, cid in enumerate(cluster_ids):
+                b_vec = centroids_b[cid].astype(np.float64)
+                norm_b = np.linalg.norm(b_vec)
+                if norm_a < 1e-12 or norm_b < 1e-12:
+                    dist_data[i, j] = float("nan")
+                else:
+                    cos_sim = np.dot(a_vec, b_vec) / (norm_a * norm_b)
+                    # Clip to [-1, 1] to guard against floating-point noise
+                    dist_data[i, j] = float(1.0 - np.clip(cos_sim, -1.0, 1.0))
+
+    elif distance_metric == "mahalanobis":
+        if cov_inv is None:
+            raise ValueError("cov_inv must be provided for Mahalanobis distance")
+        VI = cov_inv.astype(np.float64)
+        for i, b in enumerate(behaviors):
+            a_vec = centroids_a[b].astype(np.float64)
+            for j, cid in enumerate(cluster_ids):
+                diff = a_vec - centroids_b[cid].astype(np.float64)
+                maha_sq = float(diff @ VI @ diff)
+                dist_data[i, j] = float(np.sqrt(max(maha_sq, 0.0)))
+
+    else:
+        raise ValueError(
+            f"Unknown distance_metric '{distance_metric}'. "
+            "Choose from: euclidean, cosine, mahalanobis"
+        )
+
+    return pd.DataFrame(dist_data, index=pd.Index(behaviors, name="behavior"),
+                        columns=pd.Index(cluster_ids, name="cluster_id"))
+
+
+def _estimate_covariance_inverse(
+    cov_sum: np.ndarray,
+    cov_sum_sq: np.ndarray,
+    cov_count: int,
+    regularization_frac: float = 0.01,
+) -> np.ndarray:
+    """
+    Estimate the inverse of the global covariance from running accumulators.
+
+    Uses Tikhonov regularisation: cov_reg = cov + (alpha * trace(cov) / d) * I.
+    This ensures invertibility even in high-dimensional spaces.
+
+    Parameters
+    ----------
+    cov_sum : np.ndarray (128,) — sum of all frame vectors
+    cov_sum_sq : np.ndarray (128, 128) — sum of outer products: Σ v @ v.T
+    cov_count : int — number of frames accumulated
+    regularization_frac : float — fraction of mean variance added to diagonal
+
+    Returns
+    -------
+    np.ndarray (128, 128), the regularised precision matrix (cov^-1).
+    """
+    d = cov_sum.shape[0]
+    mean_vec = cov_sum / cov_count
+    cov = cov_sum_sq / cov_count - np.outer(mean_vec, mean_vec)
+
+    # Symmetrise (guard against floating-point asymmetry)
+    cov = (cov + cov.T) / 2.0
+
+    # Tikhonov regularisation: add epsilon * I
+    epsilon = regularization_frac * float(np.trace(cov)) / d
+    epsilon = max(epsilon, 1e-6)  # absolute floor
+    cov_reg = cov + epsilon * np.eye(d, dtype=np.float64)
+
+    logger.info(
+        "Covariance estimated from %d frames, regularization ε=%.6f "
+        "(trace=%.4f, d=%d)",
+        cov_count, epsilon, float(np.trace(cov)), d
+    )
+
+    cov_inv = np.linalg.pinv(cov_reg)
+    return cov_inv.astype(np.float64)
+
+
+# ── V-record embedding preloader ─────────────────────────────────────────────
+
+def _preload_v_record_embeddings(
+    segment_registry: dict,
+    code_to_ss: dict[str, str],
+    embeddings_dir: "Path",
+    v_codes: list[str],
+) -> dict[str, dict[str, np.ndarray]]:
+    """
+    Load all embedding CSVs for V-record subject-sessions once.
+
+    Returns
+    -------
+    dict: subject_session → {segment_name → np.ndarray (N_frames × 128, float16)}
+    """
+    ss_to_embeddings: dict[str, dict[str, np.ndarray]] = {}
+
+    for code in v_codes:
+        ss = code_to_ss.get(code)
+        if ss is None or ss in ss_to_embeddings:
+            continue
+
+        seg_dirs = [
+            embeddings_dir / seg_name
+            for seg_name in segment_registry
+            if seg_name.startswith(ss)
+        ]
+        if not seg_dirs:
+            logger.warning("No embedding segments found for %s", ss)
+            continue
+
+        seg_embeddings: dict[str, np.ndarray] = {}
+        for seg_dir in seg_dirs:
+            csv_path = seg_dir / "features_lisbet_embedding.csv"
+            if not csv_path.exists():
+                continue
+            try:
+                emb = pd.read_csv(csv_path, index_col=0).to_numpy(dtype=np.float16)
+                seg_embeddings[seg_dir.name] = emb
+            except Exception as exc:
+                logger.warning("Failed to load embedding %s: %s", csv_path, exc)
+
+        if seg_embeddings:
+            ss_to_embeddings[ss] = seg_embeddings
+        else:
+            logger.warning("No embeddings loaded for %s", ss)
+
+    logger.info(
+        "Preloaded embeddings for %d / %d V-record subject-sessions",
+        len(ss_to_embeddings), len(set(code_to_ss.values()))
+    )
+    return ss_to_embeddings
+
+
+# ── Core centroid computation ─────────────────────────────────────────────────
+
+def _compute_annotation_centroids_for_level(
+    annotations_df: pd.DataFrame,
+    segment_registry: dict,
+    code_to_ss: dict[str, str],
+    frame_to_cluster: dict,
+    ss_to_embeddings: dict[str, dict[str, np.ndarray]],
+    fps: int,
+    label_col: str,
+    distance_metric: str,
+    cov_inv: np.ndarray | None,
+) -> dict[str, object]:
+    """
+    Internal: compute centroids for one annotation level using preloaded embeddings.
+
+    Parameters
+    ----------
+    annotations_df : DataFrame with `label_col` as the behavior label column.
+    label_col : which column to read labels from ("behavior" for L1, "label" for L2/L3).
+    distance_metric : "euclidean" | "cosine" | "mahalanobis"
+    cov_inv : required for mahalanobis, ignored otherwise.
+
+    Returns dict with same keys as run_annotation_centroids().
+    """
+    v_codes = sorted(annotations_df["code"].unique())
+    n_labels = annotations_df[label_col].nunique()
+    logger.info(
+        "Computing annotation centroids: %d labels, %d V-records, metric=%s",
+        n_labels, len(v_codes), distance_metric
+    )
+
+    behavior_embeddings: dict[str, list[np.ndarray]] = {}
+    event_embedding_means: dict[str, list[np.ndarray]] = {}
+    cluster_sum: dict[int, np.ndarray] = {}
+    cluster_count: dict[int, int] = {}
+
+    for code in v_codes:
+        ss = code_to_ss.get(code)
+        if ss is None:
+            continue
+        seg_embeddings = ss_to_embeddings.get(ss)
+        if not seg_embeddings:
+            continue
+
+        events = annotations_df[annotations_df["code"] == code]
+        for _, ev in events.iterrows():
+            frame_list = annotation_to_frames(ev, segment_registry, fps,
+                                              subject_session_filter=ss)
+            if not frame_list:
+                continue
+
+            label = str(ev.get(label_col, "unknown"))
+            if label not in behavior_embeddings:
+                behavior_embeddings[label] = []
+                event_embedding_means[label] = []
+
+            event_vecs: list[np.ndarray] = []
+            for seg_name, rel_frame in frame_list:
+                emb_arr = seg_embeddings.get(seg_name)
+                if emb_arr is None or rel_frame >= len(emb_arr):
+                    continue
+                vec = emb_arr[rel_frame].astype(np.float32)
+                event_vecs.append(vec)
+                behavior_embeddings[label].append(vec)
+
+                cluster_id = frame_to_cluster.get((seg_name, rel_frame))
+                if cluster_id is not None:
+                    cid = int(cluster_id)
+                    if cid not in cluster_sum:
+                        cluster_sum[cid] = np.zeros(128, dtype=np.float64)
+                        cluster_count[cid] = 0
+                    cluster_sum[cid] += vec
+                    cluster_count[cid] += 1
+
+            if event_vecs:
+                event_embedding_means[label].append(
+                    np.mean(event_vecs, axis=0).astype(np.float32)
+                )
+
+    # Annotation centroids (event-weighted: mean of per-event means)
+    annotation_centroids: dict[str, np.ndarray] = {}
+    for label, event_means in event_embedding_means.items():
+        if not event_means:
+            continue
+        means_mat = np.array(event_means, dtype=np.float32)
+        annotation_centroids[label] = means_mat.mean(axis=0).astype(np.float32)
+        n_frames = len(behavior_embeddings.get(label, []))
+        logger.info(
+            "Centroid '%s': %d events (%d frames)",
+            label, len(event_means), n_frames
+        )
+
+    if not annotation_centroids:
+        logger.warning("No annotation centroids computed")
+        return {}
+
+    # Cluster centroids (from V-record frames)
+    cluster_centroids_dict = {
+        cid: (cluster_sum[cid] / cluster_count[cid]).astype(np.float32)
+        for cid in cluster_sum
+    }
+    cluster_centroids_df = pd.DataFrame(cluster_centroids_dict).T
+    cluster_centroids_df.index.name = "cluster_id"
+
+    # Distance matrix
+    distance_matrix = _compute_pairwise_distances(
+        annotation_centroids, cluster_centroids_dict,
+        distance_metric=distance_metric, cov_inv=cov_inv,
+    )
+
+    # Cluster labeling: nearest annotation centroid per cluster
+    cluster_ids = sorted(cluster_centroids_dict.keys())
+    label_rows = []
+    for cid in cluster_ids:
+        if cid not in distance_matrix.columns:
+            continue
+        col = distance_matrix[cid]
+        nearest_behavior = col.idxmin()
+        min_dist = float(col.min())
+        label_rows.append({
+            "cluster_id": cid,
+            "nearest_behavior": nearest_behavior,
+            "min_distance": min_dist,
+        })
+    cluster_labels_df = pd.DataFrame(label_rows).set_index("cluster_id")
+
+    logger.info(
+        "Annotation centroids: %d labels, %d clusters labeled (metric=%s)",
+        len(annotation_centroids), len(cluster_ids), distance_metric
+    )
+
+    return {
+        "annotation_centroids": annotation_centroids,
+        "cluster_centroids": cluster_centroids_df,
+        "distance_matrix": distance_matrix,
+        "cluster_behavior_labels": cluster_labels_df,
+        "event_embedding_means": event_embedding_means,
+        "distance_metric": distance_metric,
+    }
+
+
 def run_annotation_centroids(
     cluster_mapping: pd.DataFrame,
     annotations_df: pd.DataFrame,
@@ -213,26 +524,35 @@ def run_annotation_centroids(
     clinical_df: pd.DataFrame,
     embeddings_dir: str | Path,
     fps: int = 20,
+    distance_metric: str = "euclidean",
 ) -> dict[str, object]:
     """
     Compute mean 128-D embedding per behavior ("Annotation Centroid") and
     label each global cluster by its nearest annotation centroid.
 
-    Uses existing data.py from behavior_clustering to load embeddings.
+    Parameters
+    ----------
+    distance_metric : str
+        "euclidean" (default), "cosine", or "mahalanobis".
+        For mahalanobis, the global covariance is estimated from all V-record
+        frames accumulated during the embedding loading pass.
 
     Returns
     -------
     dict with keys:
         "annotation_centroids"   : dict[behavior → np.ndarray shape (128,)]
         "cluster_centroids"      : pd.DataFrame (cluster_id × 128 dims)
-        "distance_matrix"        : pd.DataFrame (behavior × cluster, Euclidean distances)
+        "distance_matrix"        : pd.DataFrame (behavior × cluster, distances)
         "cluster_behavior_labels": pd.DataFrame (cluster_id, nearest_behavior, min_distance)
+        "event_embedding_means"  : dict[behavior → list of np.ndarray shape (128,)]
+        "distance_metric"        : str — the metric that was used
+        "cov_inv"                : np.ndarray (128, 128) | None — precision matrix
+                                   (set when distance_metric == "mahalanobis")
     """
     from pathlib import Path as _Path
-
     embeddings_dir = _Path(embeddings_dir)
 
-    # Build code → subject_session map (same fallback logic as run_annotation_overlap)
+    # Build code → subject_session map
     code_to_ss: dict[str, str] = {}
     if "code" in clinical_df.columns:
         for uuid_str, row in clinical_df.iterrows():
@@ -246,7 +566,6 @@ def run_annotation_centroids(
                 uuid, session = parse_subject_session(session_segs[0])
                 code_to_ss[code] = f"{uuid}_{session}" if session else uuid
 
-    # Build frame→cluster lookup
     frame_to_cluster = (
         cluster_mapping
         .set_index(["segment_name", "index"])["cluster_id"]
@@ -254,150 +573,177 @@ def run_annotation_centroids(
     )
 
     v_codes = sorted(annotations_df["code"].unique())
-    logger.info(
-        "Computing annotation centroids for %d behaviors across %d V-records",
-        annotations_df["behavior"].nunique(), len(v_codes)
+
+    # Preload all V-record embeddings once
+    ss_to_embeddings = _preload_v_record_embeddings(
+        segment_registry, code_to_ss, embeddings_dir, v_codes
     )
 
-    # Accumulate embeddings per behavior and per cluster
-    # behavior → list of embedding vectors
-    behavior_embeddings: dict[str, list[np.ndarray]] = {}
-    # cluster_id → list of embedding vectors (for computing cluster centroids)
-    cluster_sum: dict[int, np.ndarray] = {}
-    cluster_count: dict[int, int] = {}
+    # Estimate covariance for Mahalanobis (extra pass over preloaded embeddings)
+    cov_inv: np.ndarray | None = None
+    if distance_metric == "mahalanobis":
+        cov_inv = _estimate_cov_inv_from_preloaded(ss_to_embeddings)
 
-    for code in v_codes:
-        ss = code_to_ss.get(code)
-        if ss is None:
-            continue
+    result = _compute_annotation_centroids_for_level(
+        annotations_df=annotations_df,
+        segment_registry=segment_registry,
+        code_to_ss=code_to_ss,
+        frame_to_cluster=frame_to_cluster,
+        ss_to_embeddings=ss_to_embeddings,
+        fps=fps,
+        label_col="behavior",
+        distance_metric=distance_metric,
+        cov_inv=cov_inv,
+    )
+    result["cov_inv"] = cov_inv
+    return result
 
-        # Load embeddings for all segments of this subject-session
-        seg_dirs_for_ss = [
-            embeddings_dir / seg_name
-            for seg_name in segment_registry
-            if seg_name.startswith(ss)
-        ]
-        if not seg_dirs_for_ss:
-            logger.warning("No embedding segments found for %s", ss)
-            continue
 
-        # Load each segment embedding CSV
-        seg_embeddings: dict[str, np.ndarray] = {}
-        for seg_dir in seg_dirs_for_ss:
-            csv_path = seg_dir / "features_lisbet_embedding.csv"
-            if not csv_path.exists():
-                continue
-            try:
-                emb = pd.read_csv(csv_path, index_col=0).to_numpy(dtype=np.float16)
-                seg_name = seg_dir.name
-                seg_embeddings[seg_name] = emb
-            except Exception as exc:
-                logger.warning("Failed to load embedding %s: %s", csv_path, exc)
-                continue
+def _estimate_cov_inv_from_preloaded(
+    ss_to_embeddings: dict[str, dict[str, np.ndarray]],
+    regularization_frac: float = 0.01,
+) -> np.ndarray:
+    """Estimate precision matrix from all preloaded V-record frame embeddings."""
+    dim = 128
+    cov_sum = np.zeros(dim, dtype=np.float64)
+    cov_sum_sq = np.zeros((dim, dim), dtype=np.float64)
+    cov_count = 0
 
-        if not seg_embeddings:
-            logger.warning("No embeddings loaded for %s", ss)
-            continue
+    for seg_embeddings in ss_to_embeddings.values():
+        for emb_arr in seg_embeddings.values():
+            frames = emb_arr.astype(np.float64)  # (N_frames, 128)
+            cov_sum += frames.sum(axis=0)
+            cov_sum_sq += frames.T @ frames      # (128, 128)
+            cov_count += len(frames)
 
-        events = annotations_df[annotations_df["code"] == code]
-        for _, ev in events.iterrows():
-            frame_list = annotation_to_frames(ev, segment_registry, fps,
-                                              subject_session_filter=ss)
-            if not frame_list:
-                continue
-
-            behavior = str(ev.get("behavior", "unknown"))
-            if behavior not in behavior_embeddings:
-                behavior_embeddings[behavior] = []
-
-            for seg_name, rel_frame in frame_list:
-                emb_arr = seg_embeddings.get(seg_name)
-                if emb_arr is None or rel_frame >= len(emb_arr):
-                    continue
-                vec = emb_arr[rel_frame].astype(np.float32)
-                behavior_embeddings[behavior].append(vec)
-
-                # Also accumulate per-cluster
-                cluster_id = frame_to_cluster.get((seg_name, rel_frame))
-                if cluster_id is not None:
-                    cid = int(cluster_id)
-                    if cid not in cluster_sum:
-                        cluster_sum[cid] = np.zeros(128, dtype=np.float64)
-                        cluster_count[cid] = 0
-                    cluster_sum[cid] += vec
-                    cluster_count[cid] += 1
-
-    # Compute annotation centroids
-    annotation_centroids: dict[str, np.ndarray] = {}
-    for behavior, vecs in behavior_embeddings.items():
-        if len(vecs) == 0:
-            logger.warning("No embedding vectors for behavior '%s'", behavior)
-            continue
-        annotation_centroids[behavior] = np.mean(vecs, axis=0).astype(np.float32)
-        logger.info(
-            "Annotation centroid '%s': computed from %d frames", behavior, len(vecs)
+    if cov_count < dim + 1:
+        logger.warning(
+            "Too few frames (%d) to estimate a reliable 128D covariance. "
+            "Falling back to identity (diagonal) for Mahalanobis.",
+            cov_count
         )
+        return np.eye(dim, dtype=np.float64)
 
-    if not annotation_centroids:
-        logger.warning("No annotation centroids computed — check embedding paths and annotations")
-        return {}
+    return _estimate_covariance_inverse(cov_sum, cov_sum_sq, cov_count, regularization_frac)
 
-    # Compute global cluster centroids (from V-record frames only)
-    # For a full run, also compute from all records (use cluster_mapping)
-    # Here we use what we accumulated from V-records; may be supplemented later.
-    cluster_centroids_dict = {
-        cid: (cluster_sum[cid] / cluster_count[cid]).astype(np.float32)
-        for cid in cluster_sum
-    }
-    cluster_centroids_df = pd.DataFrame(cluster_centroids_dict).T
-    cluster_centroids_df.index.name = "cluster_id"
 
-    # Distance matrix: behavior × cluster
-    behaviors = sorted(annotation_centroids.keys())
-    cluster_ids = sorted(cluster_centroids_dict.keys())
+# ── Multi-level centroid analysis ─────────────────────────────────────────────
 
-    dist_data = np.zeros((len(behaviors), len(cluster_ids)), dtype=np.float32)
-    for i, behavior in enumerate(behaviors):
-        cent = annotation_centroids[behavior]
-        for j, cid in enumerate(cluster_ids):
-            clust_cent = cluster_centroids_dict[cid]
-            dist_data[i, j] = float(np.linalg.norm(cent - clust_cent))
+def run_annotation_centroids_multilevel(
+    cluster_mapping: pd.DataFrame,
+    annotations_df: pd.DataFrame,
+    segment_registry: dict,
+    clinical_df: pd.DataFrame,
+    embeddings_dir: str | Path,
+    fps: int = 20,
+    distance_metric: str = "euclidean",
+) -> dict[str, dict[str, object]]:
+    """
+    Run annotation centroid analysis at all three label hierarchy levels (L1/L2/L3).
 
-    distance_matrix = pd.DataFrame(dist_data, index=behaviors, columns=cluster_ids)
+    Embeddings are loaded **once** and reused across all three levels, making
+    this substantially faster than calling run_annotation_centroids three times.
+    The global covariance (for Mahalanobis) is also estimated once.
 
-    # Cluster labeling: nearest annotation centroid per cluster
-    label_rows = []
-    for cid in cluster_ids:
-        col = distance_matrix[cid]
-        nearest_behavior = col.idxmin()
-        min_dist = float(col.min())
-        label_rows.append({
-            "cluster_id": cid,
-            "nearest_behavior": nearest_behavior,
-            "min_distance": min_dist,
-        })
-    cluster_labels_df = pd.DataFrame(label_rows).set_index("cluster_id")
+    Parameters
+    ----------
+    distance_metric : str
+        "euclidean" | "cosine" | "mahalanobis"
 
-    logger.info(
-        "Annotation centroids: %d behaviors, %d clusters labeled",
-        len(annotation_centroids), len(cluster_ids)
+    Returns
+    -------
+    dict with keys "L1", "L2", "L3", each containing the same dict as
+    run_annotation_centroids() would return for that level.
+    """
+    from pathlib import Path as _Path
+    embeddings_dir = _Path(embeddings_dir)
+
+    # Build code → subject_session map
+    code_to_ss: dict[str, str] = {}
+    if "code" in clinical_df.columns:
+        for uuid_str, row in clinical_df.iterrows():
+            code = row.get("code")
+            if not isinstance(code, str):
+                continue
+            session_segs = [s for s in segment_registry if s.startswith(str(uuid_str))]
+            if not session_segs:
+                session_segs = [s for s in segment_registry if s.startswith(code)]
+            if session_segs:
+                uuid, session = parse_subject_session(session_segs[0])
+                code_to_ss[code] = f"{uuid}_{session}" if session else uuid
+
+    frame_to_cluster = (
+        cluster_mapping
+        .set_index(["segment_name", "index"])["cluster_id"]
+        .to_dict()
     )
 
-    return {
-        "annotation_centroids": annotation_centroids,
-        "cluster_centroids": cluster_centroids_df,
-        "distance_matrix": distance_matrix,
-        "cluster_behavior_labels": cluster_labels_df,
-    }
+    v_codes = sorted(annotations_df["code"].unique())
+
+    # ── Load embeddings once ─────────────────────────────────────────────────
+    logger.info(
+        "run_annotation_centroids_multilevel: preloading embeddings for "
+        "%d V-record codes (metric=%s)...", len(v_codes), distance_metric
+    )
+    ss_to_embeddings = _preload_v_record_embeddings(
+        segment_registry, code_to_ss, embeddings_dir, v_codes
+    )
+
+    # ── Estimate covariance once (for Mahalanobis) ───────────────────────────
+    cov_inv: np.ndarray | None = None
+    if distance_metric == "mahalanobis":
+        cov_inv = _estimate_cov_inv_from_preloaded(ss_to_embeddings)
+
+    # ── Build multilevel label DataFrames ────────────────────────────────────
+    level_dfs = build_multilevel_annotations(annotations_df)
+    # level_dfs["L1"] has "label" == behavior name
+    # level_dfs["L2"/"L3"] have "label" == composite string
+
+    results: dict[str, object] = {}
+    for level, ann_level_df in level_dfs.items():
+        if ann_level_df.empty:
+            logger.warning("Level %s: no annotations, skipping centroid analysis", level)
+            results[level] = {}
+            continue
+
+        logger.info(
+            "── Computing annotation centroids at level %s (%d unique labels) ──",
+            level, ann_level_df["label"].nunique()
+        )
+        level_result = _compute_annotation_centroids_for_level(
+            annotations_df=ann_level_df,
+            segment_registry=segment_registry,
+            code_to_ss=code_to_ss,
+            frame_to_cluster=frame_to_cluster,
+            ss_to_embeddings=ss_to_embeddings,
+            fps=fps,
+            label_col="label",       # multilevel DataFrames use "label" column
+            distance_metric=distance_metric,
+            cov_inv=cov_inv,
+        )
+        results[level] = level_result
+
+    # Expose cov_inv at the top level for bootstrap_centroid_distances()
+    results["cov_inv"] = cov_inv
+
+    return results
 
 
 def save_annotation_centroids(
     centroids: dict[str, np.ndarray],
     output_dir: Path,
+    suffix: str = "",
 ) -> None:
-    """Save annotation centroids dict as a pickle file."""
+    """Save annotation centroids dict as a pickle file.
+
+    Parameters
+    ----------
+    suffix : str
+        Optional suffix appended to the filename before the extension,
+        e.g. ``"_L1"`` → ``annotation_centroids_L1.pkl``.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
-    pkl_path = output_dir / "annotation_centroids.pkl"
+    pkl_path = output_dir / f"annotation_centroids{suffix}.pkl"
     with open(pkl_path, "wb") as f:
         pickle.dump(centroids, f)
     logger.info("Annotation centroids saved to %s", pkl_path)

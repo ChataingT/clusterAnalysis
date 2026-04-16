@@ -20,6 +20,8 @@ Functions:
     plot_kinematic_heatmap         — clusters × kinematics (z-scored)
     plot_vsubset_consistency       — V vs non-V kinematic scatter
     plot_embedding_kinematic_heatmap — embedding dims × kinematics
+    plot_enrichment_significance_overview — volcano + N-events + significance heatmap
+    plot_centroid_bootstrap_overview — CI width heatmap + nearest-cluster stability
 """
 
 from __future__ import annotations
@@ -222,12 +224,21 @@ def plot_annotation_centroid_distance(
     distance_matrix: pd.DataFrame,
     output_dir: Path,
     top_n_clusters: int = 40,
+    title_suffix: str = "",
+    filename_suffix: str = "",
     formats: list[str] = ("png", "pdf"),
     dpi: int = 300,
 ) -> None:
-    """Heatmap of 128D Euclidean distances between annotation centroids and cluster centroids."""
+    """Heatmap of 128D centroid distances between annotation centroids and cluster centroids."""
     if distance_matrix.empty:
         return
+
+    # Infer metric from suffix for the colorbar label
+    metric_label = "distance (128D)"
+    for m in ("euclidean", "cosine", "mahalanobis"):
+        if m in title_suffix.lower():
+            metric_label = f"{m} distance (128D)"
+            break
 
     # Show only top-N clusters (lowest mean distance across behaviors)
     mean_dist = distance_matrix.mean(axis=0)
@@ -246,17 +257,18 @@ def plot_annotation_centroid_distance(
         figsize=figsize,
         dendrogram_ratio=(0.12, 0.08),
         linewidths=0.2, linecolor="white",
-        cbar_kws={"label": "Euclidean distance (128D)", "shrink": 0.6},
+        cbar_kws={"label": metric_label.capitalize(), "shrink": 0.6},
     )
     g.ax_heatmap.set_xlabel("Cluster ID", labelpad=8)
     g.ax_heatmap.set_ylabel("Behavior", labelpad=8)
     plt.setp(g.ax_heatmap.get_xticklabels(), rotation=90, fontsize=7)
     plt.setp(g.ax_heatmap.get_yticklabels(), rotation=0, fontsize=9)
     g.figure.suptitle(
-        f"Annotation–cluster centroid distances (top {n_cols} closest clusters)",
+        f"Annotation–cluster centroid distances (top {n_cols} closest clusters){title_suffix}",
         y=1.01, fontsize=11,
     )
-    _clustermap_save(g, output_dir, "annotation_centroid_distance", formats, dpi)
+    filename = f"annotation_centroid_distance{filename_suffix}"
+    _clustermap_save(g, output_dir, filename, formats, dpi)
 
 
 # ── Clinical volcano plot ─────────────────────────────────────────────────────
@@ -781,3 +793,342 @@ def plot_kruskal_wallis_results(
     ax.legend(handles=[sig_patch, ns_patch], loc="lower right")
     fig.tight_layout()
     _save_fig(fig, output_dir, stem, formats, dpi)
+
+
+# ── Significance overview plots ───────────────────────────────────────────────
+
+def plot_enrichment_significance_overview(
+    perm_result,
+    output_dir: Path,
+    level: str = "L1",
+    top_n_clusters: int = 30,
+    alpha: float = 0.05,
+    formats: list[str] | None = None,
+    dpi: int = 300,
+) -> None:
+    """
+    3-panel significance overview for the annotation enrichment permutation test.
+
+    Panels
+    ------
+    Top-left  : Volcano plot — log2(enrichment) vs -log10(p_fdr).
+                Each point = one (behavior, cluster) pair.
+                Colored by direction: red = over-represented, blue = under-represented.
+                Horizontal dashed line = FDR significance threshold.
+                Vertical dashed lines at ±log2(1.5) = 50% fold-change guideline.
+
+    Top-right : N annotation events per behavior (horizontal bar chart).
+                Shows the statistical power proxy — behaviors with few events
+                will have wide null distributions and low power.
+
+    Bottom    : Significance heatmap — behaviors × top-N clusters (ranked by
+                maximum absolute log2-enrichment).
+                Cells are colored by log2-enrichment (red=over, blue=under).
+                Non-significant cells (p_fdr ≥ α) are shown in light grey.
+                FDR-significant cells are annotated with their sig_label (*/***).
+
+    Parameters
+    ----------
+    perm_result : PermutationEnrichmentResult
+        Output of permutation_test_enrichment().
+    output_dir : Path
+    level : str
+        Annotation hierarchy level (used in the figure title and filename).
+    top_n_clusters : int
+        Number of clusters to show in the heatmap (ranked by |log2_effect|).
+    alpha : float
+        FDR significance threshold.
+    formats, dpi : plot format options.
+    """
+    from .significance import PermutationEnrichmentResult
+
+    formats = formats or ["png"]
+    if perm_result.long_format.empty:
+        logger.warning("plot_enrichment_significance_overview: empty result, skipping")
+        return
+
+    long_df = perm_result.long_format.copy()
+    p_fdr_df = perm_result.p_fdr
+    log2_df = perm_result.log2_effect
+    sig_df = perm_result.significant
+    sig_label_df = perm_result.sig_label
+    n_events = perm_result.n_events_per_label
+
+    # ── Select top clusters for heatmap ─────────────────────────────────────
+    if log2_df.empty:
+        logger.warning("plot_enrichment_significance_overview: no log2_effect data, skipping")
+        return
+
+    # Rank clusters by maximum |log2_effect| across all behaviors
+    max_abs_effect = log2_df.abs().max(axis=0)
+    top_clusters = max_abs_effect.nlargest(top_n_clusters).index.tolist()
+    log2_heat = log2_df[top_clusters].copy()
+    sig_heat = sig_df[top_clusters].copy() if not sig_df.empty else pd.DataFrame(False, index=log2_heat.index, columns=top_clusters)
+    siglbl_heat = sig_label_df[top_clusters].copy() if not sig_label_df.empty else pd.DataFrame("ns", index=log2_heat.index, columns=top_clusters)
+
+    # ── Figure layout ────────────────────────────────────────────────────────
+    n_behaviors = len(log2_heat)
+    heatmap_h = max(4, n_behaviors * 0.5 + 1)
+    fig = plt.figure(figsize=(18, heatmap_h + 6))
+    gs = fig.add_gridspec(
+        2, 2,
+        height_ratios=[5, max(3, heatmap_h)],
+        hspace=0.45, wspace=0.35,
+    )
+    ax_volcano = fig.add_subplot(gs[0, 0])
+    ax_nevents = fig.add_subplot(gs[0, 1])
+    ax_heatmap = fig.add_subplot(gs[1, :])
+
+    # ── Panel 1: Volcano plot ─────────────────────────────────────────────────
+    finite_mask = long_df["p_fdr"].notna() & long_df["log2_enrichment"].notna()
+    vdf = long_df[finite_mask].copy()
+    vdf["neg_log10_p"] = -np.log10(np.maximum(vdf["p_fdr"].astype(float), 1e-10))
+    vdf["color"] = np.where(
+        vdf["significant"] & (vdf["log2_enrichment"] > 0), "#D63031",   # over-represented
+        np.where(
+            vdf["significant"] & (vdf["log2_enrichment"] < 0), "#2980B9",  # under-represented
+            "#BBBBBB",  # not significant
+        )
+    )
+
+    ax_volcano.scatter(
+        vdf["log2_enrichment"], vdf["neg_log10_p"],
+        c=vdf["color"], s=18, alpha=0.7, linewidths=0,
+    )
+
+    threshold_y = -np.log10(alpha)
+    ax_volcano.axhline(threshold_y, color="black", linestyle="--", linewidth=0.8,
+                       label=f"FDR = {alpha}")
+    ax_volcano.axvline(np.log2(1.5), color="#AAAAAA", linestyle=":", linewidth=0.7)
+    ax_volcano.axvline(-np.log2(1.5), color="#AAAAAA", linestyle=":", linewidth=0.7)
+    ax_volcano.axvline(0, color="black", linewidth=0.5)
+
+    over_patch = mpatches.Patch(color="#D63031", label="Over-represented (sig.)")
+    under_patch = mpatches.Patch(color="#2980B9", label="Under-represented (sig.)")
+    ns_patch = mpatches.Patch(color="#BBBBBB", label="Not significant")
+    ax_volcano.legend(handles=[over_patch, under_patch, ns_patch],
+                      fontsize=7, loc="upper left", framealpha=0.8)
+
+    n_sig = int(vdf["significant"].sum())
+    n_total = len(vdf)
+    ax_volcano.set_xlabel("log₂(enrichment)", fontsize=9)
+    ax_volcano.set_ylabel("−log₁₀(p_fdr)", fontsize=9)
+    ax_volcano.set_title(
+        f"Volcano — level {level}\n"
+        f"{n_sig}/{n_total} pairs significant (FDR {alpha}), "
+        f"{perm_result.n_permutations} permutations",
+        fontsize=9,
+    )
+
+    # ── Panel 2: N events per behavior ────────────────────────────────────────
+    events_df = n_events[n_events > 0].sort_values(ascending=True)
+    # Show only behaviors that appear in the permutation result
+    valid_behaviors = set(log2_df.index.tolist())
+    events_df = events_df[events_df.index.isin(valid_behaviors)]
+
+    bar_colors = ["#E84040" if n < 5 else "#4E93C8" for n in events_df.values]
+    ax_nevents.barh(events_df.index, events_df.values, color=bar_colors, height=0.6)
+    ax_nevents.axvline(5, color="#888888", linestyle="--", linewidth=0.8,
+                       label="N=5 guideline")
+    ax_nevents.set_xlabel("N annotation events", fontsize=9)
+    ax_nevents.set_title(f"Sample size (power proxy) — level {level}", fontsize=9)
+    ax_nevents.legend(fontsize=7, loc="lower right")
+    for i, (lbl, val) in enumerate(events_df.items()):
+        ax_nevents.text(val + 0.1, i, str(val), va="center", fontsize=7)
+
+    # ── Panel 3: Significance heatmap ─────────────────────────────────────────
+    # Build display matrix: log2_effect where significant, NaN elsewhere → greyed
+    display_data = log2_heat.copy().astype(float)
+    display_data[~sig_heat] = float("nan")
+
+    # Background for non-significant cells
+    bg_data = log2_heat.copy().astype(float)
+    bg_data[sig_heat] = float("nan")
+
+    vmax = float(log2_heat.abs().quantile(0.95).max()) or 2.0
+    vmax = max(vmax, 0.5)
+
+    ax_heatmap.set_facecolor("#F0F0F0")
+
+    # Non-significant background (light grey)
+    im_bg = ax_heatmap.imshow(
+        bg_data.values, aspect="auto", cmap="Greys",
+        vmin=0, vmax=1, alpha=0.3,
+    )
+
+    # Significant cells colored by effect
+    im = ax_heatmap.imshow(
+        display_data.values, aspect="auto",
+        cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+    )
+
+    ax_heatmap.set_xticks(range(len(top_clusters)))
+    ax_heatmap.set_xticklabels(
+        [str(c) for c in top_clusters],
+        rotation=90, fontsize=6,
+    )
+    ax_heatmap.set_yticks(range(n_behaviors))
+    ax_heatmap.set_yticklabels(log2_heat.index.tolist(), fontsize=8)
+    ax_heatmap.set_xlabel(f"Cluster ID (top {top_n_clusters} by |log₂ effect|)", fontsize=9)
+    ax_heatmap.set_ylabel("Behavior", fontsize=9)
+    ax_heatmap.set_title(
+        f"Enrichment significance — level {level} "
+        f"(colored = FDR-significant, grey = not significant)",
+        fontsize=9,
+    )
+
+    # Annotate significant cells with sig_label
+    for b_idx, behavior in enumerate(log2_heat.index):
+        for c_idx, cid in enumerate(top_clusters):
+            if sig_heat.loc[behavior, cid]:
+                lbl = siglbl_heat.loc[behavior, cid]
+                if lbl != "ns":
+                    ax_heatmap.text(
+                        c_idx, b_idx, lbl,
+                        ha="center", va="center",
+                        fontsize=5, color="black", fontweight="bold",
+                    )
+
+    plt.colorbar(im, ax=ax_heatmap, label="log₂(enrichment)", shrink=0.6, pad=0.01)
+
+    fig.suptitle(
+        f"Annotation-Cluster Enrichment Significance — Level {level}\n"
+        f"Event-level permutation test (n={perm_result.n_permutations}), "
+        f"FDR-BH correction",
+        fontsize=11, fontweight="bold",
+    )
+
+    _save_fig(fig, output_dir, f"annotation_enrichment_significance_{level}", formats, dpi)
+    logger.info(
+        "Enrichment significance overview saved for level %s (%d sig. pairs)",
+        level, n_sig
+    )
+
+
+def plot_centroid_bootstrap_overview(
+    boot_result,
+    output_dir: Path,
+    top_n_clusters: int = 40,
+    level: str = "L1",
+    formats: list[str] | None = None,
+    dpi: int = 300,
+) -> None:
+    """
+    2-panel bootstrap CI overview for annotation centroid distances.
+
+    Panels
+    ------
+    Left  : CI width heatmap — behaviors × top-N clusters (by observed distance).
+            Narrow CI (blue) = centroid is well-determined by the available events.
+            Wide CI (red) = high uncertainty; interpret with caution.
+
+    Right : Nearest-cluster stability bar chart — per behavior, the fraction of
+            bootstrap resamples where the same cluster is the nearest neighbor.
+            High stability (→1) = reliable cluster assignment.
+            Low stability (→0) = assignment is uncertain (consider more events).
+
+    Parameters
+    ----------
+    boot_result : BootstrapCentroidResult
+        Output of bootstrap_centroid_distances().
+    output_dir : Path
+    top_n_clusters : int
+        Number of clusters to show in the CI width heatmap (closest by distance).
+    formats, dpi : plot format options.
+    """
+    formats = formats or ["png"]
+    if boot_result.long_format.empty:
+        logger.warning("plot_centroid_bootstrap_overview: empty result, skipping")
+        return
+
+    obs_dist = boot_result.observed_distance
+    ci_width = boot_result.ci_width
+    stability_df = boot_result.nearest_cluster_stability
+    n_events = boot_result.n_events_per_label
+
+    if obs_dist.empty or ci_width.empty:
+        logger.warning("plot_centroid_bootstrap_overview: no distance data, skipping")
+        return
+
+    # Select top-N clusters by minimum observed distance across all behaviors
+    min_dist_per_cluster = obs_dist.min(axis=0)
+    top_clusters = min_dist_per_cluster.nsmallest(top_n_clusters).index.tolist()
+
+    obs_sub = obs_dist[top_clusters]
+    ci_sub = ci_width[top_clusters]
+
+    n_behaviors = len(obs_sub)
+
+    # ── Figure layout ────────────────────────────────────────────────────────
+    fig_h = max(5, n_behaviors * 0.45 + 2)
+    fig, (ax_ci, ax_stab) = plt.subplots(
+        1, 2,
+        figsize=(18, fig_h),
+        gridspec_kw={"width_ratios": [2.5, 1]},
+    )
+
+    # ── Panel 1: CI width heatmap ─────────────────────────────────────────────
+    ci_arr = ci_sub.values.astype(float)
+    vmax_ci = float(np.nanpercentile(ci_arr, 95)) if np.any(np.isfinite(ci_arr)) else 1.0
+    vmax_ci = max(vmax_ci, 0.01)
+
+    im = ax_ci.imshow(ci_arr, aspect="auto", cmap="RdYlBu_r", vmin=0, vmax=vmax_ci)
+    ax_ci.set_xticks(range(len(top_clusters)))
+    ax_ci.set_xticklabels([str(c) for c in top_clusters], rotation=90, fontsize=6)
+    ax_ci.set_yticks(range(n_behaviors))
+    ax_ci.set_yticklabels(obs_sub.index.tolist(), fontsize=8)
+    ax_ci.set_xlabel(f"Cluster ID (top {top_n_clusters} closest)", fontsize=9)
+    ax_ci.set_ylabel("Behavior", fontsize=9)
+    metric = getattr(boot_result, "distance_metric", "euclidean")
+    ax_ci.set_title(
+        f"Bootstrap CI Width on Centroid Distances ({level}, {metric})\n"
+        f"(n={boot_result.n_bootstrap} resamples, 95% CI; "
+        f"blue=narrow=precise, red=wide=uncertain)",
+        fontsize=9,
+    )
+    cbar = plt.colorbar(im, ax=ax_ci, label=f"CI width ({metric} distance)", shrink=0.8)
+    cbar.ax.tick_params(labelsize=7)
+
+    # ── Panel 2: Nearest-cluster stability ────────────────────────────────────
+    if stability_df is not None and not stability_df.empty and \
+            "fraction_bootstrap_same_nearest" in stability_df.columns:
+        stab = stability_df["fraction_bootstrap_same_nearest"].sort_values(ascending=True)
+        stab = stab[stab.index.isin(obs_sub.index)]
+
+        bar_colors = [
+            "#2ECC71" if v >= 0.8 else "#F39C12" if v >= 0.5 else "#E74C3C"
+            for v in stab.values
+        ]
+        ax_stab.barh(stab.index.tolist(), stab.values, color=bar_colors, height=0.6)
+        ax_stab.axvline(0.8, color="#2ECC71", linestyle="--", linewidth=0.8, label="≥80% stable")
+        ax_stab.axvline(0.5, color="#F39C12", linestyle=":", linewidth=0.8, label="≥50% stable")
+        ax_stab.set_xlim(0, 1.05)
+        ax_stab.set_xlabel("Fraction bootstrap agreeing on nearest cluster", fontsize=9)
+        ax_stab.set_title(
+            f"Nearest-cluster stability\n(N events per behavior in parentheses)",
+            fontsize=9,
+        )
+        ax_stab.legend(fontsize=7, loc="lower right")
+
+        # Annotate with N events and stability %
+        for i, (lbl, val) in enumerate(stab.items()):
+            n_ev = int(n_events.get(lbl, 0))
+            ax_stab.text(
+                val + 0.01, i,
+                f"{val:.0%} (N={n_ev})",
+                va="center", fontsize=7,
+            )
+    else:
+        ax_stab.text(0.5, 0.5, "No stability data", ha="center", va="center",
+                     transform=ax_stab.transAxes, fontsize=10)
+        ax_stab.set_title("Nearest-cluster stability", fontsize=9)
+
+    fig.suptitle(
+        f"Annotation Centroid Bootstrap — Distance Confidence Intervals ({level}, {metric})\n"
+        f"(N={boot_result.n_bootstrap} resamples of annotation events per behavior)",
+        fontsize=11, fontweight="bold",
+    )
+    fig.tight_layout()
+    filename = f"annotation_centroid_bootstrap_overview_{level}"
+    _save_fig(fig, output_dir, filename, formats, dpi)
+    logger.info("Centroid bootstrap overview saved for level %s (metric=%s)", level, metric)

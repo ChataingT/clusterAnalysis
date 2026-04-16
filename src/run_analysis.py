@@ -521,18 +521,130 @@ def main(argv: list[str] | None = None) -> int:
                 logger.error("Annotation overlap failed: %s", exc, exc_info=True)
                 summary["errors"].append(f"annotation_overlap: {exc}")
 
-    # ── Analysis 2: Annotation centroids (global cluster centroids) ──────────
+    # ── Significance 1: Enrichment permutation test (per level) ─────────────
+    if (cfg.analyses.annotation_overlap_significance and ann_overlap_multilevel):
+        with _timed("Annotation overlap significance (permutation test)"):
+            try:
+                from .annotation_analysis import build_multilevel_annotations
+                from .significance import build_event_cluster_matrix, permutation_test_enrichment
+
+                sig_cfg = cfg.statistics.significance
+
+                # Compute global cluster counts in V-records (same denominator as enrichment)
+                l1_per_record = ann_overlap_multilevel.get("L1", {}).get(
+                    "per_record", pd.DataFrame()
+                )
+                v_subject_sessions: set[str] = set()
+                if not l1_per_record.empty and "subject_session" in l1_per_record.columns:
+                    v_subject_sessions = set(
+                        l1_per_record.loc[
+                            l1_per_record["n_matched"] > 0, "subject_session"
+                        ].dropna().astype(str)
+                    )
+                v_seg_names = {
+                    s for s in cluster_mapping["segment_name"].unique()
+                    if any(s.startswith(ss) for ss in v_subject_sessions)
+                }
+                v_frames_cm = cluster_mapping[cluster_mapping["segment_name"].isin(v_seg_names)]
+                global_cluster_counts = v_frames_cm["cluster_id"].value_counts().sort_index()
+                global_cluster_counts.index = global_cluster_counts.index.astype(int)
+                logger.info(
+                    "Global V-record cluster counts: %d clusters, %d total frames",
+                    len(global_cluster_counts), int(global_cluster_counts.sum())
+                )
+
+                # Build multilevel annotation DataFrames (with 'label' column)
+                level_dfs = build_multilevel_annotations(annotations_df)
+
+                for level, ann_level_df in level_dfs.items():
+                    if ann_level_df.empty:
+                        continue
+                    # Rename 'label' → 'behavior' to match build_event_cluster_matrix signature
+                    ann_renamed = ann_level_df.copy()
+                    ann_renamed["behavior"] = ann_renamed["label"]
+
+                    logger.info(
+                        "Building event-cluster matrix for level %s (%d events)...",
+                        level, len(ann_renamed)
+                    )
+                    evt_matrix, evt_labels, evt_meta = build_event_cluster_matrix(
+                        cluster_mapping=cluster_mapping,
+                        annotations_df=ann_renamed,
+                        segment_registry=segment_registry,
+                        clinical_df=clinical_df,
+                        fps=cfg.data.fps,
+                    )
+
+                    if evt_matrix.shape[0] == 0:
+                        logger.warning("Level %s: no events collected, skipping significance", level)
+                        continue
+
+                    # Align global_cluster_counts to event_cluster_matrix column order
+                    # (columns correspond to sorted cluster IDs from build_event_cluster_matrix)
+                    all_cids_sorted = sorted(
+                        cluster_mapping["cluster_id"].dropna().unique().astype(int)
+                    )
+                    gc_aligned = global_cluster_counts.reindex(all_cids_sorted, fill_value=0)
+
+                    perm_result = permutation_test_enrichment(
+                        event_cluster_matrix=evt_matrix,
+                        labels=evt_labels,
+                        event_meta=evt_meta,
+                        global_cluster_counts=gc_aligned,
+                        n_permutations=sig_cfg.n_permutations,
+                        seed=sig_cfg.seed,
+                        fdr_method=cfg.statistics.fdr_method,
+                        alpha=cfg.statistics.alpha,
+                        min_events=sig_cfg.min_events_per_label,
+                    )
+
+                    if cfg.output.save_data and not perm_result.long_format.empty:
+                        _save_csv(
+                            perm_result.long_format,
+                            data_dir / f"annotation_cluster_significance_{level}.csv",
+                            f"enrichment_significance_{level}",
+                        )
+                        _save_csv(
+                            perm_result.p_fdr,
+                            data_dir / f"annotation_cluster_pfdr_{level}.csv",
+                            f"enrichment_pfdr_{level}",
+                        )
+                        _save_csv(
+                            perm_result.log2_effect,
+                            data_dir / f"annotation_cluster_log2effect_{level}.csv",
+                            f"enrichment_log2effect_{level}",
+                        )
+
+                    if cfg.output.save_plots and not perm_result.long_format.empty:
+                        from .visualization import plot_enrichment_significance_overview
+                        plot_enrichment_significance_overview(
+                            perm_result, output_dir,
+                            level=level,
+                            alpha=cfg.statistics.alpha,
+                            formats=cfg.output.plot_formats,
+                            dpi=cfg.output.figure_dpi,
+                        )
+
+            except Exception as exc:
+                logger.error("Annotation overlap significance failed: %s", exc, exc_info=True)
+                summary["errors"].append(f"annotation_overlap_significance: {exc}")
+
+    # ── Analysis 2: Annotation centroids (global cluster centroids, 3 levels) ─
+    # centroid_multilevel_results: {"L1": {...}, "L2": {...}, "L3": {...}, "cov_inv": ...}
+    # centroid_results: L1 results kept for backward-compatibility with
+    #   _synthesize_cluster_profiles / generate_cluster_report.
+    centroid_multilevel_results: dict = {}
     centroid_results: dict = {}
     global_cluster_centroids: pd.DataFrame = pd.DataFrame()
     if cfg.analyses.annotation_centroids:
-        with _timed("Annotation centroids"):
+        with _timed("Annotation centroids (3-level)"):
             try:
                 from .annotation_analysis import (
-                    run_annotation_centroids,
+                    run_annotation_centroids_multilevel,
                     save_annotation_centroids,
                     compute_global_cluster_centroids,
                 )
-                # A4: compute global cluster centroids from ALL subjects
+                # Compute global cluster centroids from ALL subjects
                 with _timed("Global cluster centroids (all subjects)"):
                     global_cluster_centroids = compute_global_cluster_centroids(
                         cluster_mapping,
@@ -547,32 +659,128 @@ def main(argv: list[str] | None = None) -> int:
                             "global cluster centroids",
                         )
 
-                centroid_results = run_annotation_centroids(
+                centroid_multilevel_results = run_annotation_centroids_multilevel(
                     cluster_mapping, annotations_df,
                     segment_registry, clinical_df,
                     embeddings_dir=cfg.data.embeddings_dir,
                     fps=cfg.data.fps,
+                    distance_metric=cfg.annotation.distance_metric,
                 )
-                if centroid_results:
+                # L1 results kept for downstream compatibility
+                centroid_results = centroid_multilevel_results.get("L1", {})
+
+                if centroid_multilevel_results:
                     if cfg.output.save_data:
-                        save_annotation_centroids(
-                            centroid_results.get("annotation_centroids", {}),
-                            output_dir,
-                        )
-                        for key in ("distance_matrix", "cluster_behavior_labels"):
-                            df = centroid_results.get(key, pd.DataFrame())
-                            if not isinstance(df, pd.DataFrame) or df.empty:
+                        for level in ("L1", "L2", "L3"):
+                            level_res = centroid_multilevel_results.get(level, {})
+                            if not level_res:
                                 continue
-                            _save_csv(df, data_dir / f"cluster_{key}.csv", key)
+                            save_annotation_centroids(
+                                level_res.get("annotation_centroids", {}),
+                                output_dir,
+                                suffix=f"_{level}",
+                            )
+                            for key in ("distance_matrix", "cluster_behavior_labels"):
+                                df = level_res.get(key, pd.DataFrame())
+                                if not isinstance(df, pd.DataFrame) or df.empty:
+                                    continue
+                                _save_csv(df, data_dir / f"cluster_{key}_{level}.csv", key)
                     if cfg.output.save_plots:
                         from .visualization import plot_annotation_centroid_distance
-                        plot_annotation_centroid_distance(
-                            centroid_results.get("distance_matrix", pd.DataFrame()),
-                            output_dir, formats=cfg.output.plot_formats, dpi=cfg.output.figure_dpi,
-                        )
+                        for level in ("L1", "L2", "L3"):
+                            level_res = centroid_multilevel_results.get(level, {})
+                            dist_mat = level_res.get("distance_matrix", pd.DataFrame())
+                            if isinstance(dist_mat, pd.DataFrame) and not dist_mat.empty:
+                                plot_annotation_centroid_distance(
+                                    dist_mat,
+                                    output_dir,
+                                    title_suffix=(
+                                        f" ({level}, "
+                                        f"{cfg.annotation.distance_metric})"
+                                    ),
+                                    filename_suffix=f"_{level}",
+                                    formats=cfg.output.plot_formats,
+                                    dpi=cfg.output.figure_dpi,
+                                )
             except Exception as exc:
                 logger.error("Annotation centroids failed: %s", exc, exc_info=True)
                 summary["errors"].append(f"annotation_centroids: {exc}")
+
+    # ── Significance 2: Bootstrap CI on centroid distances (per level) ────────
+    if (cfg.analyses.annotation_centroids_significance and centroid_multilevel_results):
+        with _timed("Annotation centroid bootstrap CI (3-level)"):
+            try:
+                from .significance import bootstrap_centroid_distances
+
+                sig_cfg = cfg.statistics.significance
+                distance_metric = cfg.annotation.distance_metric
+                cov_inv = centroid_multilevel_results.get("cov_inv", None)
+
+                for level in ("L1", "L2", "L3"):
+                    level_res = centroid_multilevel_results.get(level, {})
+                    event_means = level_res.get("event_embedding_means", {})
+                    cluster_centroids_for_boot = level_res.get(
+                        "cluster_centroids", pd.DataFrame()
+                    )
+
+                    if not event_means:
+                        logger.warning(
+                            "No event_embedding_means for %s — skipping bootstrap", level
+                        )
+                        continue
+                    if cluster_centroids_for_boot.empty:
+                        logger.warning(
+                            "No cluster_centroids for %s — skipping bootstrap", level
+                        )
+                        continue
+
+                    logger.info("Bootstrap centroid CI: level=%s, metric=%s", level, distance_metric)
+                    boot_result = bootstrap_centroid_distances(
+                        event_means_by_behavior=event_means,
+                        cluster_centroids=cluster_centroids_for_boot,
+                        n_bootstrap=sig_cfg.n_bootstrap,
+                        seed=sig_cfg.seed,
+                        alpha_ci=0.95,
+                        min_events=sig_cfg.min_events_per_label,
+                        distance_metric=distance_metric,
+                        cov_inv=cov_inv,
+                    )
+
+                    if cfg.output.save_data and not boot_result.long_format.empty:
+                        _save_csv(
+                            boot_result.long_format,
+                            data_dir / f"annotation_centroid_bootstrap_summary_{level}.csv",
+                            f"centroid_bootstrap_summary_{level}",
+                        )
+                        _save_csv(
+                            boot_result.ci_low,
+                            data_dir / f"annotation_centroid_ci_low_{level}.csv",
+                            f"centroid_ci_low_{level}",
+                        )
+                        _save_csv(
+                            boot_result.ci_high,
+                            data_dir / f"annotation_centroid_ci_high_{level}.csv",
+                            f"centroid_ci_high_{level}",
+                        )
+                        if not boot_result.nearest_cluster_stability.empty:
+                            _save_csv(
+                                boot_result.nearest_cluster_stability,
+                                data_dir / f"annotation_centroid_nearest_stability_{level}.csv",
+                                f"centroid_nearest_stability_{level}",
+                            )
+
+                    if cfg.output.save_plots and not boot_result.long_format.empty:
+                        from .visualization import plot_centroid_bootstrap_overview
+                        plot_centroid_bootstrap_overview(
+                            boot_result, output_dir,
+                            level=level,
+                            formats=cfg.output.plot_formats,
+                            dpi=cfg.output.figure_dpi,
+                        )
+
+            except Exception as exc:
+                logger.error("Centroid bootstrap CI failed: %s", exc, exc_info=True)
+                summary["errors"].append(f"annotation_centroids_significance: {exc}")
 
     # ── Analysis 3: Clinical correlations ───────────────────────────────────
     clinical_results: dict[str, pd.DataFrame] = {}

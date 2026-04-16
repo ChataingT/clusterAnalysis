@@ -8,10 +8,10 @@
 
 data:
   # Frame-level cluster assignments (output of behavior_clustering pipeline)
-  cluster_mapping: /srv/beegfs/scratch/shares/schaerm/schaer2/video_sam2_pose/humanLISBET-paper/post_training/behavior_clustering/results/sweep_birch_thr_2.8/mapping_cluster_frame_train.csv
+  cluster_mapping: /srv/beegfs/scratch/shares/schaerm/schaer2/video_sam2_pose/humanLISBET-paper/post_training/embedding_clustering/results/sweep_birch_thr_3.0/mapping_cluster_frame_train.csv
 
   # Per-segment cluster summary (dominant cluster, diversity metrics)
-  cross_video_train: /srv/beegfs/scratch/shares/schaerm/schaer2/video_sam2_pose/humanLISBET-paper/post_training/behavior_clustering/results/sweep_birch_thr_2.8/cross_video_train.csv
+  cross_video_train: /srv/beegfs/scratch/shares/schaerm/schaer2/video_sam2_pose/humanLISBET-paper/post_training/embedding_clustering/results/sweep_birch_thr_3.0/cross_video_train.csv
 
   # Clinical metadata CSV (uuid, code, diagnosis, ADOS, MSEL, Vineland, ...)
   clinical_csv: /srv/beegfs/scratch/shares/schaerm/schaer2/video_sam2_pose/humanLISBET-paper/dataset/info/child_for_humanlisbet_paper_with_paths_020326.csv
@@ -34,38 +34,38 @@ data:
 # ─────────────────────────────────────────────────────────────────────────────
 analyses:
   # Cluster distribution during annotations (V-records only, 3 label levels)
-  annotation_overlap: true
+  annotation_overlap: false
 
   # 128D annotation centroids per label + cluster labeling
   # Centroids use global embeddings (all subjects); computed for all 3 label levels
-  annotation_centroids: true
+  annotation_centroids: false
 
   # Cluster prevalence ~ clinical metrics (ASD vs TD + continuous scores)
-  clinical_correlations: true
+  clinical_correlations: false
 
   # Per-cluster kinematic profiles (segment-level aggregates)
-  kinematic_profiles: true
+  kinematic_profiles: false
 
   # Per-cluster kinematic profiles at FRAME level (more accurate, slower)
   kinematic_frame_analysis: true
 
   # Frame-level kinematic profile per annotation label (all 3 levels)
-  annotation_kinematics: true
+  annotation_kinematics: false
 
   # 128D embedding dims × kinematic metrics (segment-level Spearman)
   embedding_kinematics: true
 
   # V-record vs non-V kinematic comparison (subset of kinematic_profiles)
-  vsubset_consistency: true
+  vsubset_consistency: false
 
   # Synthesize all analyses into per-cluster profile CSV + updated cluster report
-  cluster_profiles: true
+  cluster_profiles: false
 
   # Significance testing: event-level permutation test for enrichment,
   # bootstrap CI for centroid distances. Requires annotation_overlap /
   # annotation_centroids to also be enabled.
-  annotation_overlap_significance: true
-  annotation_centroids_significance: true
+  annotation_overlap_significance: false
+  annotation_centroids_significance: false
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -74,12 +74,26 @@ analyses:
 annotation:
   # Minimum annotated frames for a label to be included at each level
   min_frames_level1: 10   # behavior only
-  min_frames_level2: 5    # behavior + behavioral_category
-  min_frames_level3: 3    # behavior + behavioral_category + modifier_1
+  min_frames_level2: 10    # behavior + behavioral_category
+  min_frames_level3: 10    # behavior + behavioral_category + modifier_1
 
-  # Distance metric for annotation centroid → cluster centroid distances.
+  # Distance metric for annotation-centroid → cluster-centroid distances.
   # Choices: euclidean | cosine | mahalanobis
-  distance_metric: euclidean
+  #
+  # euclidean   : L2 norm in 128D space (default). Sensitive to scale differences
+  #               between embedding dimensions. Fast and interpretable.
+  #
+  # cosine      : 1 - cosine_similarity = 1 - (a·b)/(‖a‖·‖b‖). Measures
+  #               angular distance, ignoring vector magnitude. Natural for
+  #               embeddings where direction encodes behavior identity but
+  #               magnitude reflects activity intensity.
+  #
+  # mahalanobis : Accounts for correlations and unequal variances between
+  #               embedding dimensions. Equivalent to Euclidean after whitening
+  #               the embedding space. Covariance estimated from all V-record
+  #               frames with Tikhonov regularization (prevents singular matrices).
+  #               Most discriminative but computationally heavier.
+  distance_metric: cosine
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,23 +158,23 @@ statistics:
   alpha: 0.05
 
   # Clusters with fewer total frames than this threshold are flagged in reports
-  min_frames_per_cluster: 100
+  min_frames_per_cluster: 10
 
   # Significance testing parameters
   significance:
     # Number of label-shuffle permutations for enrichment test
     # (higher = more precise p-values, especially for p < 0.01)
-    n_permutations: 1000
+    n_permutations: 100000
 
     # Bootstrap resamples for centroid distance confidence intervals
-    n_bootstrap: 500
+    n_bootstrap: 10000
 
     # Random seed — set for full reproducibility
     seed: 42
 
     # Behaviors with fewer annotation events than this are skipped
-    # (too few events -> unstable event-level permutation and bootstrap estimates)
-    min_events_per_label: 5
+    # (too few events → unreliable permutation null distribution)
+    min_events_per_label: 10
 
     # Number of parallel workers (reserved for future use)
     n_jobs: 1
