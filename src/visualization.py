@@ -329,50 +329,65 @@ def plot_clinical_correlation_heatmap(
     if continuous_results.empty:
         return
 
-    pivot_rho = continuous_results.pivot(index="cluster_id", columns="metric", values="rho")
-    pivot_sig = continuous_results.pivot(index="cluster_id", columns="metric", values="significant")
+    def _plot_scope(scope_df: pd.DataFrame, scope_name: str | None = None) -> None:
+        if scope_df.empty:
+            return
 
-    # Select top-N clusters by max |rho| across metrics
-    max_rho = pivot_rho.abs().max(axis=1)
-    top_clusters = max_rho.nlargest(min(top_n_clusters, len(pivot_rho))).index
-    data_rho = pivot_rho.loc[top_clusters]
-    data_sig = pivot_sig.loc[top_clusters]
+        pivot_rho = scope_df.pivot(index="cluster_id", columns="metric", values="rho")
+        pivot_sig = scope_df.pivot(index="cluster_id", columns="metric", values="significant")
 
-    any_significant = data_sig.fillna(False).any().any()
-    n_rows, n_cols = data_rho.shape
-    figsize = (max(10, n_cols * 1.2 + 3), max(7, n_rows * 0.35 + 3))
+        # Select top-N clusters by max |rho| across metrics
+        max_rho = pivot_rho.abs().max(axis=1)
+        top_clusters = max_rho.nlargest(min(top_n_clusters, len(pivot_rho))).index
+        data_rho = pivot_rho.loc[top_clusters]
+        data_sig = pivot_sig.loc[top_clusters]
 
-    # Build mask (None when nothing is significant, so raw rho is shown unmasked)
-    mask = (~data_sig.fillna(False)) if any_significant else None
-    cbar_label = "Spearman ρ" if any_significant else "Spearman ρ (none significant)"
+        any_significant = data_sig.fillna(False).any().any()
+        n_rows, n_cols = data_rho.shape
+        figsize = (max(10, n_cols * 1.2 + 3), max(7, n_rows * 0.35 + 3))
 
-    g = sns.clustermap(
-        data_rho.fillna(0),
-        method="ward", metric="euclidean",
-        row_cluster=(n_rows >= 2), col_cluster=(n_cols >= 2),
-        mask=mask,
-        cmap="RdBu_r", center=0, vmin=-0.6, vmax=0.6,
-        linewidths=0.3, linecolor="white",
-        xticklabels=True, yticklabels=True,
-        figsize=figsize,
-        dendrogram_ratio=(0.10, 0.08),
-        cbar_kws={"label": cbar_label, "shrink": 0.5},
-    )
-    # Grey background highlights non-significant (masked) cells
-    if any_significant:
-        g.ax_heatmap.set_facecolor("#EEEEEE")
+        # Build mask (None when nothing is significant, so raw rho is shown unmasked)
+        mask = (~data_sig.fillna(False)) if any_significant else None
+        cbar_label = "Spearman ρ" if any_significant else "Spearman ρ (none significant)"
 
-    g.ax_heatmap.set_xlabel("Clinical metric", labelpad=8)
-    g.ax_heatmap.set_ylabel("Cluster ID", labelpad=8)
-    plt.setp(g.ax_heatmap.get_xticklabels(), rotation=30, ha="right", fontsize=9)
-    plt.setp(g.ax_heatmap.get_yticklabels(), rotation=0, fontsize=8)
+        g = sns.clustermap(
+            data_rho.fillna(0),
+            method="ward", metric="euclidean",
+            row_cluster=(n_rows >= 2), col_cluster=(n_cols >= 2),
+            mask=mask,
+            cmap="RdBu_r", center=0, vmin=-0.6, vmax=0.6,
+            linewidths=0.3, linecolor="white",
+            xticklabels=True, yticklabels=True,
+            figsize=figsize,
+            dendrogram_ratio=(0.10, 0.08),
+            cbar_kws={"label": cbar_label, "shrink": 0.5},
+        )
+        # Grey background highlights non-significant (masked) cells
+        if any_significant:
+            g.ax_heatmap.set_facecolor("#EEEEEE")
 
-    sig_note = f"grey = p_fdr ≥ {alpha}" if any_significant else f"NO SIGNIFICANT CORRELATIONS (p_fdr ≥ {alpha})"
-    g.figure.suptitle(
-        f"Cluster prevalence ~ clinical metrics\n(Spearman ρ, {sig_note})",
-        y=1.01, fontsize=11,
-    )
-    _clustermap_save(g, output_dir, "clinical_correlation_heatmap", formats, dpi)
+        g.ax_heatmap.set_xlabel("Clinical metric", labelpad=8)
+        g.ax_heatmap.set_ylabel("Cluster ID", labelpad=8)
+        plt.setp(g.ax_heatmap.get_xticklabels(), rotation=30, ha="right", fontsize=9)
+        plt.setp(g.ax_heatmap.get_yticklabels(), rotation=0, fontsize=8)
+
+        sig_note = f"grey = p_fdr ≥ {alpha}" if any_significant else f"NO SIGNIFICANT CORRELATIONS (p_fdr ≥ {alpha})"
+        scope_label = "all subjects" if scope_name in (None, "all") else f"scope={scope_name}"
+        g.figure.suptitle(
+            f"Cluster prevalence ~ clinical metrics ({scope_label})\n(Spearman ρ, {sig_note})",
+            y=1.01, fontsize=11,
+        )
+
+        stem = "clinical_correlation_heatmap"
+        if scope_name is not None:
+            stem = f"{stem}_{scope_name}"
+        _clustermap_save(g, output_dir, stem, formats, dpi)
+
+    if "scope" in continuous_results.columns:
+        for scope_name in continuous_results["scope"].dropna().unique().tolist():
+            _plot_scope(continuous_results[continuous_results["scope"] == scope_name], str(scope_name))
+    else:
+        _plot_scope(continuous_results, None)
 
 
 # ── Clinical violin plots ─────────────────────────────────────────────────────

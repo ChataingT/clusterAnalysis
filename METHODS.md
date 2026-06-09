@@ -143,57 +143,70 @@ where ground-truth behavioral labels are required.
 
 ---
 
-## Kinematic Profiles (Segment Level)
-
-Kinematics are measured at segment level (`metrics_summary.csv`): for each
-segment, the `norm_mean` of each kinematic metric is used (normalized by trunk
-height for within-subject comparability).
-
-The **dominant cluster** for each segment is taken from `cross_video_train.csv`
-(the cluster ID that covers the most frames in that segment).
-
-Per-cluster profiles are computed as **frame-count-weighted means**:
-
-```
-profile_mean(K, metric) = Σ_seg [ n_frames(seg) × metric_mean(seg) ] / Σ_seg n_frames(seg)
-      (sum over segments whose dominant cluster is K)
-```
-
-This weighting ensures longer segments contribute proportionally more.
-
-**V vs non-V consistency:** The same profiles are computed separately for V-records
-and non-V records, then compared. High correlation (ρ > 0.7) confirms that clusters
-have consistent kinematic signatures regardless of annotation availability, supporting
-the validity of using V-record annotations to interpret globally-derived clusters.
-
----
-
 ## Kinematic Profiles (Frame Level)
 
-Unlike the segment-level approach, frame-level kinematic profiling directly aligns
-individual frames with their cluster assignment by loading `metrics_normalised.csv`
-per segment (65 kinematic columns × N frames per segment).
+Kinematic profiling is performed at **frame level only**. Each frame is matched to
+its own cluster assignment and corresponding kinematic values from
+`metrics_normalised.csv` (or `metrics_summary.csv` when normalization is disabled).
+
+This avoids the dominant-cluster approximation and preserves within-segment
+cluster transitions.
 
 **Procedure:**
-1. For each segment, load `metrics_normalised.csv` (65 columns × N frames).
-2. Join each frame with its cluster ID from the cluster mapping via `(segment_name, frame_index)`.
-3. Accumulate per-cluster statistics using running sum and sum-of-squares (memory-efficient;
-   processes one segment at a time without loading all frames simultaneously):
+1. For each segment, load per-frame kinematics (65 columns × N frames).
+2. Join each frame with its cluster ID from the mapping via `(segment_name, frame_index)`.
+3. Stream over frames and accumulate per-cluster, per-metric running totals:
+   valid count, sum, and sum-of-squares (memory-efficient; one segment at a time).
    ```
-   mean(K, metric) = Σ frames_in_K  metric_value  /  n_frames(K)
-   std(K, metric)  = sqrt( E[X²] - E[X]² )
+   mean(K, m) = Σ x / n_valid(K, m)
+   std(K, m)  = sqrt( E[X²] - E[X]² )  over valid values only
    ```
-4. For significance testing, up to 5,000 frame samples per cluster are retained in
-   memory (subsampled uniformly as frames are processed).
+4. Keep a bounded reservoir sample (up to 5,000 frames per cluster) for
+   distributional summaries and inferential testing.
+
+### Robustness checks (missingness + outliers)
+
+For each cluster K and metric m:
+
+1. Compute missingness robustness:
+   ```
+   valid_ratio(K, m) = n_valid(K, m) / n_frames(K)
+   ```
+2. If `valid_ratio(K, m) < min_valid_ratio_per_metric` (default 0.6), the metric
+   is excluded for that cluster and all derived statistics are set to NaN.
+3. For skewness and kurtosis only, apply Tukey fences on sampled values:
+   ```
+   IQR = Q3 - Q1
+   lower = Q1 - k * IQR
+   upper = Q3 + k * IQR
+   ```
+   with `k = tukey_fence_k` (default 3.0).
+4. Skewness and kurtosis are computed on in-fence values only. If filtered
+   variance is zero (or too few samples remain), skewness and kurtosis are set to NaN.
+
+### Reported per-cluster kinematic statistics
+
+For each metric, the profile table includes:
+- `__mean`
+- `__std`
+- `__median`
+- `__p05`
+- `__p95`
+- `__skew` (Tukey-robust)
+- `__kurtosis` (Tukey-robust)
+- `__valid_ratio`
+- `__excluded_missing`
+
 
 **Kruskal-Wallis test:** For each kinematic metric, a Kruskal-Wallis H-test is run
 with clusters as groups (using the retained samples). BH-FDR correction is applied
 over all metrics simultaneously. A significant result means the metric takes
 significantly different values across clusters at the frame level.
 
-Frame-level profiles are more accurate than segment-level profiles because they avoid
-the "dominant cluster" approximation — every frame is matched to its own cluster
-rather than the segment's most common one.
+**Configuration knobs:** robustness parameters are exposed in `statistics`:
+- `min_valid_ratio_per_metric` (default 0.6)
+- `tukey_fence_k` (default 3.0)
+- `kruskal_max_samples_per_cluster` (default 5000)
 
 ---
 
@@ -225,8 +238,8 @@ is generated with one row per cluster, combining:
 
 - **Annotation label**: nearest annotation centroid at L1 (embedding distance)
 - **Enrichment top behavior**: L1 behavior with highest observed/expected enrichment
-- **Kinematic signature**: top-3 high and top-3 low z-scored metrics (frame-level
-  profiles preferred; falls back to segment-level if frame-level unavailable)
+- **Kinematic signature**: top-3 high and top-3 low z-scored metrics from
+   frame-level kinematic profiles
 - **Clinical significance**: p_fdr and Cohen's d for each binary group comparison
 - **Top clinical correlations**: up to 3 significant Spearman correlations with
   continuous clinical scores (sorted by |ρ|)
@@ -238,16 +251,26 @@ individual analysis files.
 
 ## Semantic Dictionary (Embedding × Kinematics)
 
-For each segment, the mean 128-D embedding vector is computed (mean over all frames
-in the segment). This gives a (N_segments × 128) matrix.
+For each segment, the per-frame embedding rows are loaded without averaging.
+The matching per-frame kinematic rows are loaded from the corresponding pose
+record and the two tables are aligned by frame index. All matched frame rows
+are then concatenated across segments / records.
+
+The kinematic side of this analysis uses the same per-frame metric columns as
+the rest of the pipeline. The correlation is therefore computed on frame rows,
+not on segment-level summaries.
 
 Spearman correlation is computed between each of the 128 dimensions and each
-kinematic metric across segments. This produces a (128 × N_metrics) correlation
-matrix, corrected for multiple testing (BH-FDR over all 128 × 65 = 8,320 pairs).
+kinematic metric across matched frame rows. This produces a (128 × N_metrics)
+correlation matrix, corrected for multiple testing (BH-FDR over all pairs).
 
 Significant correlations reveal which embedding dimensions "encode" which physical
 movements — forming a human-interpretable "dictionary" of what the transformer has
 learned to represent.
+
+**Sampling control:** the analysis can optionally use only a random subset of the
+common frame rows via `statistics.embedding_max_common_frames`. If that setting is
+`null`, all common frames are used, which preserves the current default behavior.
 
 ---
 
@@ -276,10 +299,10 @@ are expected to be false).
    analysis by processing each (segment, frame) independently; aggregate cluster
    statistics are robust to this.
 
-3. **Dominant cluster approximation (segment-level only):** The segment-level
-   kinematic analysis uses the per-segment dominant cluster, ignoring within-segment
-   cluster variation. The frame-level kinematic analysis (Analysis 7) does not have
-   this limitation and should be preferred for interpretation.
+3. **Missingness-driven exclusions:** For sparse metrics, some
+   (cluster, metric) pairs are intentionally excluded when
+   `valid_ratio < min_valid_ratio_per_metric`. This increases robustness but can
+   reduce comparability across clusters for those metrics.
 
 4. **Annotation centroid noise:** Annotation centroids for rare behaviors are computed
    from few frames and may not be representative of the full embedding distribution.
@@ -291,7 +314,11 @@ are expected to be false).
    session structure (e.g., clinician positioning) as much as the behavior itself.
    The background comparison (non-annotated V-record frames) partially controls for this.
 
-6. **Frame-level kinematic memory:** The Kruskal-Wallis test uses up to 5,000
-   subsampled frames per cluster (not the full frame set) to stay within memory limits.
-   For very large clusters this is conservative; the effect estimate (mean/std) uses
-   all frames via running statistics.
+6. **Frame-level kinematic sampling for inference:** Distributional summaries
+   (median, percentiles, skewness, kurtosis) and Kruskal-Wallis rely on a bounded
+   reservoir sample (up to 5,000 frames/cluster) to control memory. Mean and std use
+   all valid frames via running statistics, but higher-order/tail summaries are sample-based.
+
+7. **Tukey-fence sensitivity:** Skewness and kurtosis depend on `tukey_fence_k`.
+   Larger values keep more tail observations; smaller values increase robustness but
+   may suppress true heavy-tail structure.

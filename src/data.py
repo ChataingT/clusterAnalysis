@@ -241,6 +241,13 @@ def load_kinematics_summary(
     prefix = "norm" if use_normalized else "raw"
     mean_col = f"{prefix}_mean"
     std_col = f"{prefix}_std"
+    extra_cols = {
+        "median": f"{prefix}_median",
+        "p05": f"{prefix}_p05",
+        "p95": f"{prefix}_p95",
+        "skew": f"{prefix}_skew",
+        "kurtosis": f"{prefix}_kurtosis",
+    }
 
     records = []
     skipped = []
@@ -281,6 +288,11 @@ def load_kinematics_summary(
             if std_col in summary.columns:
                 row_std = summary[std_col].rename(lambda m: f"{m}__std")
                 row = pd.concat([row, row_std])
+
+            for suffix, col_name in extra_cols.items():
+                if col_name in summary.columns:
+                    row_extra = summary[col_name].rename(lambda m, s=suffix: f"{m}__{s}")
+                    row = pd.concat([row, row_extra])
 
             if metrics is not None:
                 keep = [c for c in row.index if any(c.startswith(m) for m in metrics)]

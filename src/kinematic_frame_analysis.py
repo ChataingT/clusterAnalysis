@@ -13,9 +13,9 @@ profile.
 Outputs
 -------
 - cluster_kinematic_frame_profiles.csv
-    Per-cluster mean ± std for all kinematic metrics, with frame counts.
+    Per-cluster robust profile statistics for all kinematic metrics, with frame counts.
 - kinematic_frame_kruskal.csv
-    Kruskal-Wallis H-statistic and p-value per metric (clusters as groups).
+    Kruskal-Wallis H-statistic, p-value, and effect size per metric (clusters as groups).
     FDR-corrected p-values (BH method) included.
 """
 
@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import stats
+import pickle
 
 from .stats import fdr_correct
 
@@ -35,6 +36,75 @@ logger = logging.getLogger(__name__)
 POSE_RECORD_PREFIX = "results_skeleton_"
 NORM_METRICS_FILENAME = "metrics_normalised.csv"
 RAW_METRICS_FILENAME = "metrics_summary.csv"
+
+
+def _tukey_filter(values: np.ndarray, k: float = 3.0) -> np.ndarray:
+    """Filter values using Tukey fences with configurable factor k."""
+    if values.size == 0:
+        return values
+
+    q1, q3 = np.percentile(values, [25, 75])
+    iqr = q3 - q1
+    if not np.isfinite(iqr):
+        return np.array([], dtype=float)
+    if iqr == 0:
+        # Keep constant-valued distributions unchanged.
+        return values
+
+    lower = q1 - k * iqr
+    upper = q3 + k * iqr
+
+    ret = values[(values >= lower) & (values <= upper)]
+    # percent_filtered = 100.0 * (1.0 - len(ret) / len(values))
+    # logger.info("Tukey filtered %0.2f%% of values", percent_filtered)
+    return ret
+
+
+def _compute_metric_distribution_stats(
+    values: np.ndarray,
+    tukey_fence_k: float = 3.0,
+) -> dict[str, float]:
+    """
+    Compute robust distribution statistics for one metric.
+
+    Skewness and kurtosis are computed on Tukey-filtered values.
+    If filtered variance is zero, skewness/kurtosis return NaN.
+    """
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return {
+            "median": float("nan"),
+            "p95": float("nan"),
+            "p05": float("nan"),
+            "skew": float("nan"),
+            "kurtosis": float("nan"),
+        }
+
+
+
+    filtered = _tukey_filter(finite, k=tukey_fence_k)
+    if filtered.size < 3 or float(np.var(filtered)) == 0.0:
+        return {
+            "median": float("nan"),
+            "p95": float("nan"),
+            "p05": float("nan"),
+            "skew": float("nan"),
+            "kurtosis": float("nan"),
+        }
+    else:
+        median = float(np.median(finite))
+        p95 = float(np.percentile(finite, 95))
+        p05 = float(np.percentile(finite, 5))
+        skew = float(stats.skew(filtered, bias=False))
+        kurtosis = float(stats.kurtosis(filtered, fisher=True, bias=False))
+
+    return {
+        "median": median,
+        "p95": p95,
+        "p05": p05,
+        "skew": skew,
+        "kurtosis": kurtosis,
+    }
 
 
 def _load_segment_frame_metrics(
@@ -94,6 +164,9 @@ def run_kinematic_frame_analysis(
     use_normalized: bool = True,
     metric_cols: list[str] | None = None,
     min_frames_per_cluster: int = 100,
+    min_valid_ratio_per_metric: float = 0.6,
+    tukey_fence_k: float = 3.0,
+    kruskal_max_samples_per_cluster: int = 5000,
     fdr_method: str = "bh",
     alpha: float = 0.05,
 ) -> dict[str, pd.DataFrame]:
@@ -118,6 +191,13 @@ def run_kinematic_frame_analysis(
         Subset of metric columns to load. None = load all.
     min_frames_per_cluster : int
         Clusters with fewer frames are flagged (but still included).
+    min_valid_ratio_per_metric : float
+        Minimum valid frame ratio required to keep a metric in a cluster.
+        Metrics below this threshold are marked excluded and all stats are NaN.
+    tukey_fence_k : float
+        Tukey fence factor used for robust skewness/kurtosis estimation.
+    kruskal_max_samples_per_cluster : int
+        Maximum number of frame samples retained per cluster for Kruskal-Wallis.
     fdr_method : str
         FDR correction method for Kruskal-Wallis p-values.
     alpha : float
@@ -126,8 +206,8 @@ def run_kinematic_frame_analysis(
     Returns
     -------
     dict with keys:
-        "profiles" : pd.DataFrame (cluster_id × metrics, mean/std/count)
-        "kruskal"  : pd.DataFrame (metric × H/p_raw/p_fdr/significant)
+        "profiles" : pd.DataFrame (cluster_id × metrics, robust summary stats)
+        "kruskal"  : pd.DataFrame (metric × H/p_raw/epsilon_sq/p_fdr/significant)
     """
     pose_records_dir = Path(pose_records_dir)
 
@@ -139,17 +219,17 @@ def run_kinematic_frame_analysis(
     }
     logger.info("Frame→cluster lookup: %d entries", len(frame_to_cluster))
 
-    # Running accumulators: cluster_id → {metric: [sum, sum_sq, count]}
-    # We store lists of values per cluster per metric to allow Kruskal-Wallis later.
-    # Memory constraint: store only aggregates (sum/sum_sq/n), not raw values.
-    # For Kruskal-Wallis we need the raw distributions — but storing all ~5M frames
-    # would be too large. Solution: subsample up to 5000 frames per cluster per metric.
-    MAX_SAMPLES_PER_CLUSTER = 5000
+    # Running accumulators: cluster_id → aggregate arrays per metric.
+    # For distributional stats / Kruskal-Wallis, keep a bounded reservoir sample.
+    MAX_SAMPLES_PER_CLUSTER = int(kruskal_max_samples_per_cluster)
+    rng = np.random.default_rng(42)
 
     cluster_sum: dict[int, np.ndarray] = {}
     cluster_sum_sq: dict[int, np.ndarray] = {}
+    cluster_valid_count: dict[int, np.ndarray] = {}
     cluster_count: dict[int, int] = {}
     cluster_samples: dict[int, list[np.ndarray]] = {}  # for Kruskal-Wallis
+    cluster_seen: dict[int, int] = {}
 
     discovered_metric_cols: list[str] | None = None
     n_segments_loaded = 0
@@ -210,18 +290,27 @@ def run_kinematic_frame_analysis(
                 if cluster_id not in cluster_sum:
                     cluster_sum[cluster_id] = np.zeros(n_metrics, dtype=np.float64)
                     cluster_sum_sq[cluster_id] = np.zeros(n_metrics, dtype=np.float64)
+                    cluster_valid_count[cluster_id] = np.zeros(n_metrics, dtype=np.int64)
                     cluster_count[cluster_id] = 0
                     cluster_samples[cluster_id] = []
+                    cluster_seen[cluster_id] = 0
 
                 valid_mask = ~np.isnan(row_vals)
                 vals_filled = np.where(valid_mask, row_vals, 0.0)
                 cluster_sum[cluster_id] += vals_filled
                 cluster_sum_sq[cluster_id] += vals_filled ** 2
+                cluster_valid_count[cluster_id] += valid_mask.astype(np.int64)
                 cluster_count[cluster_id] += 1
 
-                # Subsample for Kruskal-Wallis
+                # Reservoir sampling to avoid early-frame bias.
+                cluster_seen[cluster_id] += 1
+                seen = cluster_seen[cluster_id]
                 if len(cluster_samples[cluster_id]) < MAX_SAMPLES_PER_CLUSTER:
                     cluster_samples[cluster_id].append(row_vals.copy())
+                else:
+                    replace_idx = int(rng.integers(0, seen))
+                    if replace_idx < MAX_SAMPLES_PER_CLUSTER:
+                        cluster_samples[cluster_id][replace_idx] = row_vals.copy()
 
             n_segments_loaded += 1
 
@@ -236,6 +325,11 @@ def run_kinematic_frame_analysis(
 
     n_metrics = len(discovered_metric_cols)
 
+    # save kinemtics selected for debugging
+    with open("debug_selected_kinematic_metrics.pkl", "wb") as f:
+        pickle.dump(discovered_metric_cols, f)
+
+
     # ── Build profile DataFrame ─────────────────────────────────────────────
     profile_rows = []
     for cluster_id in sorted(cluster_sum.keys()):
@@ -244,16 +338,52 @@ def run_kinematic_frame_analysis(
             continue
         s = cluster_sum[cluster_id]
         s2 = cluster_sum_sq[cluster_id]
-        mean = s / n
-        # Variance via Welford-equivalent: E[X^2] - E[X]^2
-        var = np.maximum(s2 / n - mean ** 2, 0.0)
-        std = np.sqrt(var)
+        valid_n = cluster_valid_count[cluster_id].astype(np.float64)
+
+        mean = np.full(n_metrics, np.nan, dtype=np.float64)
+        std = np.full(n_metrics, np.nan, dtype=np.float64)
+        valid_nonzero = valid_n > 0
+        mean[valid_nonzero] = s[valid_nonzero] / valid_n[valid_nonzero]
+        # Variance via E[X^2] - E[X]^2 on valid observations only
+        var = np.full(n_metrics, np.nan, dtype=np.float64)
+        var[valid_nonzero] = np.maximum(
+            s2[valid_nonzero] / valid_n[valid_nonzero] - mean[valid_nonzero] ** 2,
+            0.0,
+        )
+        std[valid_nonzero] = np.sqrt(var[valid_nonzero])
+
+        sampled_arr = np.stack(cluster_samples[cluster_id], axis=0) if cluster_samples[cluster_id] else np.empty((0, n_metrics), dtype=np.float32)
 
         row: dict = {"cluster_id": cluster_id, "n_frames": n,
                      "flagged_low_frames": n < min_frames_per_cluster}
         for j, col in enumerate(discovered_metric_cols):
+            valid_ratio = float(valid_n[j] / n) if n > 0 else 0.0
+            excluded = valid_ratio < min_valid_ratio_per_metric
+
+            row[f"{col}__valid_ratio"] = valid_ratio
+            row[f"{col}__excluded_missing"] = excluded
+
+            if excluded:
+                row[f"{col}__mean"] = float("nan")
+                row[f"{col}__std"] = float("nan")
+                row[f"{col}__median"] = float("nan")
+                row[f"{col}__p95"] = float("nan")
+                row[f"{col}__p05"] = float("nan")
+                row[f"{col}__skew"] = float("nan")
+                row[f"{col}__kurtosis"] = float("nan")
+                continue
+
+            dist_stats = _compute_metric_distribution_stats(
+                sampled_arr[:, j] if sampled_arr.shape[0] > 0 else np.array([], dtype=float),
+                tukey_fence_k=tukey_fence_k,
+            )
             row[f"{col}__mean"] = float(mean[j])
             row[f"{col}__std"] = float(std[j])
+            row[f"{col}__median"] = dist_stats["median"]
+            row[f"{col}__p95"] = dist_stats["p95"]
+            row[f"{col}__p05"] = dist_stats["p05"]
+            row[f"{col}__skew"] = dist_stats["skew"]
+            row[f"{col}__kurtosis"] = dist_stats["kurtosis"]
         profile_rows.append(row)
 
     profiles_df = pd.DataFrame(profile_rows).set_index("cluster_id")
@@ -289,6 +419,7 @@ def run_kinematic_frame_analysis(
         if len(groups) < 2:
             kruskal_rows.append({
                 "metric": metric, "H": float("nan"), "p_raw": float("nan"),
+                "epsilon_sq": float("nan"),
                 "p_fdr": float("nan"), "significant": False,
             })
             continue
@@ -299,7 +430,16 @@ def run_kinematic_frame_analysis(
             logger.debug("Kruskal-Wallis failed for %s: %s", metric, exc)
             H, p = float("nan"), float("nan")
 
-        kruskal_rows.append({"metric": metric, "H": H, "p_raw": p})
+        # Kruskal effect size (epsilon-squared): (H - k + 1) / (N - k)
+        # with k groups and N total observations across groups.
+        k_groups = len(groups)
+        n_total = int(sum(len(g) for g in groups))
+        if np.isfinite(H) and n_total > k_groups:
+            epsilon_sq = float(max(0.0, (H - k_groups + 1.0) / (n_total - k_groups)))
+        else:
+            epsilon_sq = float("nan")
+
+        kruskal_rows.append({"metric": metric, "H": H, "p_raw": p, "epsilon_sq": epsilon_sq})
 
     kruskal_df = pd.DataFrame(kruskal_rows)
 

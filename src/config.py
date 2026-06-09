@@ -43,7 +43,17 @@ _ALLOWED_KEYS: dict[str, set[str]] = {
     "annotation": {"min_frames_level1", "min_frames_level2", "min_frames_level3", "distance_metric"},
     "kinematics": {"use_normalized", "metrics"},
     "clinical": {"binary_groups", "continuous"},
-    "statistics": {"fdr_method", "alpha", "min_frames_per_cluster", "significance"},
+    "statistics": {
+        "fdr_method",
+        "alpha",
+        "min_frames_per_cluster",
+        "min_valid_ratio_per_metric",
+        "tukey_fence_k",
+        "kruskal_max_samples_per_cluster",
+        "embedding_max_common_frames",
+        "embedding_max_common_segments",
+        "significance",
+    },
     "output": {"run_name", "results_dir", "save_plots", "save_data", "plot_formats", "figure_dpi"},
 }
 
@@ -136,6 +146,11 @@ class StatisticsConfig:
     fdr_method: str = "bh"
     alpha: float = 0.05
     min_frames_per_cluster: int = 100
+    min_valid_ratio_per_metric: float = 0.6
+    tukey_fence_k: float = 3.0
+    kruskal_max_samples_per_cluster: int = 5000
+    embedding_max_common_frames: int | None = None
+    embedding_max_common_segments: int | None = None
     significance: SignificanceConfig = field(default_factory=SignificanceConfig)
 
 
@@ -285,6 +300,15 @@ def load_config(path: str | Path) -> ClusterAnalysisConfig:
 
     stat_raw = raw.get("statistics", {})
     sig_raw = stat_raw.get("significance", {}) if isinstance(stat_raw.get("significance"), dict) else {}
+    embedding_max_common_frames_raw = stat_raw.get("embedding_max_common_frames", None)
+    embedding_max_common_segments_raw = stat_raw.get("embedding_max_common_segments", None)
+    if embedding_max_common_frames_raw is not None and embedding_max_common_segments_raw is not None:
+        raise ValueError(
+            "Use only one of statistics.embedding_max_common_frames or "
+            "statistics.embedding_max_common_segments"
+        )
+    if embedding_max_common_frames_raw is None:
+        embedding_max_common_frames_raw = embedding_max_common_segments_raw
     sig_cfg = SignificanceConfig(
         n_permutations=int(sig_raw.get("n_permutations", 1000)),
         n_bootstrap=int(sig_raw.get("n_bootstrap", 500)),
@@ -296,6 +320,19 @@ def load_config(path: str | Path) -> ClusterAnalysisConfig:
         fdr_method=str(stat_raw.get("fdr_method", "bh")),
         alpha=float(stat_raw.get("alpha", 0.05)),
         min_frames_per_cluster=int(stat_raw.get("min_frames_per_cluster", 100)),
+        min_valid_ratio_per_metric=float(stat_raw.get("min_valid_ratio_per_metric", 0.6)),
+        tukey_fence_k=float(stat_raw.get("tukey_fence_k", 3.0)),
+        kruskal_max_samples_per_cluster=int(
+            stat_raw.get("kruskal_max_samples_per_cluster", 5000)
+        ),
+        embedding_max_common_frames=(
+            None if embedding_max_common_frames_raw is None
+            else int(embedding_max_common_frames_raw)
+        ),
+        embedding_max_common_segments=(
+            None if embedding_max_common_frames_raw is None
+            else int(embedding_max_common_frames_raw)
+        ),
         significance=sig_cfg,
     )
 
@@ -324,4 +361,5 @@ def load_config(path: str | Path) -> ClusterAnalysisConfig:
         cfg.output.run_name,
         {k: v for k, v in vars(cfg.analyses).items() if v},
     )
-    return cfg
+    dict_cfg = raw  # Return the raw dict as well for any custom access patterns in the code
+    return cfg, dict_cfg

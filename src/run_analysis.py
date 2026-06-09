@@ -167,7 +167,6 @@ def _synthesize_cluster_profiles(
     binary_clinical_results: dict[str, pd.DataFrame],
     continuous_clinical_results: pd.DataFrame,
     frame_kinematic_profiles: pd.DataFrame | None,
-    segment_kinematic_profiles: pd.DataFrame | None,
     alpha: float = 0.05,
     top_n_kinematics: int = 3,
     top_n_clinical: int = 3,
@@ -194,8 +193,6 @@ def _synthesize_cluster_profiles(
         From clinical_analysis, columns: cluster_id, metric, rho, p_fdr.
     frame_kinematic_profiles : pd.DataFrame | None
         From run_kinematic_frame_analysis(), index=cluster_id, cols=metric__mean/std.
-    segment_kinematic_profiles : pd.DataFrame | None
-        From run_kinematic_analysis(), same schema. Used as fallback.
     alpha : float
         Significance threshold.
 
@@ -207,8 +204,6 @@ def _synthesize_cluster_profiles(
     cluster_ids: set[int] = set()
     if frame_kinematic_profiles is not None and not frame_kinematic_profiles.empty:
         cluster_ids.update(frame_kinematic_profiles.index.tolist())
-    if segment_kinematic_profiles is not None and not segment_kinematic_profiles.empty:
-        cluster_ids.update(segment_kinematic_profiles.index.tolist())
     for df in binary_clinical_results.values():
         if not df.empty and "cluster_id" in df.columns:
             cluster_ids.update(df["cluster_id"].tolist())
@@ -226,10 +221,8 @@ def _synthesize_cluster_profiles(
 
     cluster_ids_sorted = sorted(cluster_ids)
 
-    # Pre-compute z-scored kinematic profiles (prefer frame-level)
-    kin_profiles = frame_kinematic_profiles if (
-        frame_kinematic_profiles is not None and not frame_kinematic_profiles.empty
-    ) else segment_kinematic_profiles
+    # Pre-compute z-scored kinematic profiles from frame-level analysis only.
+    kin_profiles = frame_kinematic_profiles
 
     kin_z: pd.DataFrame | None = None
     if kin_profiles is not None and not kin_profiles.empty:
@@ -299,9 +292,12 @@ def _synthesize_cluster_profiles(
         if not continuous_clinical_results.empty:
             cols_needed = {"cluster_id", "metric", "rho", "p_fdr"}
             if cols_needed.issubset(set(continuous_clinical_results.columns)):
-                sub = continuous_clinical_results[
-                    (continuous_clinical_results["cluster_id"] == cid) &
-                    (continuous_clinical_results["p_fdr"] < alpha)
+                sub = continuous_clinical_results.copy()
+                if "scope" in sub.columns:
+                    sub = sub[sub["scope"] == "all"]
+                sub = sub[
+                    (sub["cluster_id"] == cid) &
+                    (sub["p_fdr"] < alpha)
                 ].copy()
                 if not sub.empty:
                     sub["abs_rho"] = sub["rho"].abs()
@@ -337,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Config ────────────────────────────────────────────────────────────────
     from .config import load_config
-    cfg = load_config(args.config)
+    cfg, dict_cfg = load_config(args.config)
     if args.run_name:
         cfg.output.run_name = args.run_name
 
@@ -365,6 +361,9 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("clusterAnalysis pipeline — run: %s", cfg.output.run_name)
     logger.info("Output directory: %s", output_dir)
     logger.info("=" * 60)
+    logger.info(
+        f"Config loaded: {dict_cfg}"
+    )
 
     run_start = time.perf_counter()
     summary: dict = {
@@ -794,6 +793,9 @@ def main(argv: list[str] | None = None) -> int:
                     continuous_metrics=cfg.clinical.continuous,
                     alpha=cfg.statistics.alpha,
                     fdr_method=cfg.statistics.fdr_method,
+                    n_bootstrap=cfg.statistics.significance.n_bootstrap,
+                    n_permutations=cfg.statistics.significance.n_permutations,
+                    seed=cfg.statistics.significance.seed,
                 )
                 if cfg.output.save_data:
                     for key, df in clinical_results.items():
@@ -830,49 +832,22 @@ def main(argv: list[str] | None = None) -> int:
                 logger.error("Clinical correlations failed: %s", exc, exc_info=True)
                 summary["errors"].append(f"clinical_correlations: {exc}")
 
-    # ── Analysis 4: Kinematic profiles ──────────────────────────────────────
-    kinematic_results: dict[str, pd.DataFrame] = {}
-    if cfg.analyses.kinematic_profiles and kinematics_df is not None and not subject_map.empty:
-        with _timed("Kinematic profiles"):
-            try:
-                from .kinematic_analysis import run_kinematic_analysis
-                metric_cols = [c for c in kinematics_df.columns if c.endswith("__mean")]
-                kinematic_results = run_kinematic_analysis(
-                    subject_map, kinematics_df,
-                    metric_columns=metric_cols,
-                    v_uuids=v_uuids,
-                    min_frames_per_cluster=cfg.statistics.min_frames_per_cluster,
-                )
-                if cfg.output.save_data:
-                    for key, df in kinematic_results.items():
-                        _save_csv(df, data_dir / f"cluster_kinematic_{key}.csv", f"kinematics_{key}")
-                if cfg.output.save_plots:
-                    from .visualization import plot_kinematic_heatmap, plot_vsubset_consistency
-                    if "global" in kinematic_results:
-                        plot_kinematic_heatmap(
-                            kinematic_results["global"], output_dir,
-                            stem="kinematic_heatmap_global",
-                            formats=cfg.output.plot_formats, dpi=cfg.output.figure_dpi,
-                        )
-                    if "vsubset" in kinematic_results and "nonv" in kinematic_results:
-                        plot_vsubset_consistency(
-                            kinematic_results["vsubset"], kinematic_results["nonv"],
-                            output_dir, formats=cfg.output.plot_formats, dpi=cfg.output.figure_dpi,
-                        )
-            except Exception as exc:
-                logger.error("Kinematic profiles failed: %s", exc, exc_info=True)
-                summary["errors"].append(f"kinematic_profiles: {exc}")
+    # ── Analysis 4: Segment-level kinematic profiles (deprecated) ───────────
+    # Intentionally skipped: frame-level analysis below is the canonical path.
 
     # ── Analysis 5: Embedding × kinematics ──────────────────────────────────
-    if cfg.analyses.embedding_kinematics and kinematics_df is not None and not subject_map.empty:
+    if cfg.analyses.embedding_kinematics and not cluster_mapping.empty:
         with _timed("Embedding × kinematics correlation"):
             try:
                 from .embedding_analysis import run_embedding_kinematic_correlation
-                metric_cols = [c for c in kinematics_df.columns if c.endswith("__mean")]
                 emb_results = run_embedding_kinematic_correlation(
                     cfg.data.embeddings_dir,
-                    kinematics_df, subject_map,
-                    metric_columns=metric_cols,
+                    cfg.data.pose_records_dir,
+                    cluster_mapping["segment_name"].dropna().unique().tolist(),
+                    metric_columns=cfg.kinematics.metrics,
+                    max_common_frames=cfg.statistics.embedding_max_common_frames,
+                    sampling_seed=cfg.statistics.significance.seed,
+                    use_normalized=cfg.kinematics.use_normalized,
                     alpha=cfg.statistics.alpha,
                     fdr_method=cfg.statistics.fdr_method,
                 )
@@ -903,6 +878,9 @@ def main(argv: list[str] | None = None) -> int:
                     use_normalized=cfg.kinematics.use_normalized,
                     metric_cols=cfg.kinematics.metrics,
                     min_frames_per_cluster=cfg.statistics.min_frames_per_cluster,
+                    min_valid_ratio_per_metric=cfg.statistics.min_valid_ratio_per_metric,
+                    tukey_fence_k=cfg.statistics.tukey_fence_k,
+                    kruskal_max_samples_per_cluster=cfg.statistics.kruskal_max_samples_per_cluster,
                     fdr_method=cfg.statistics.fdr_method,
                     alpha=cfg.statistics.alpha,
                 )
@@ -991,7 +969,6 @@ def main(argv: list[str] | None = None) -> int:
                     },
                     continuous_clinical_results=clinical_results.get("continuous", pd.DataFrame()),
                     frame_kinematic_profiles=frame_kinematic_results.get("profiles"),
-                    segment_kinematic_profiles=kinematic_results.get("global"),
                     alpha=cfg.statistics.alpha,
                 )
                 if cfg.output.save_data and not cluster_profiles_df.empty:
@@ -1010,13 +987,7 @@ def main(argv: list[str] | None = None) -> int:
             binary_results_for_report = {
                 k: v for k, v in clinical_results.items() if k.startswith("binary_")
             }
-            # Prefer frame-level kinematic profiles (more accurate) for report
-            kin_for_report = (
-                frame_kinematic_results.get("profiles")
-                if frame_kinematic_results.get("profiles") is not None
-                and not frame_kinematic_results.get("profiles", pd.DataFrame()).empty
-                else kinematic_results.get("global")
-            )
+            kin_for_report = frame_kinematic_results.get("profiles")
             generate_cluster_report(
                 cluster_behavior_labels=centroid_results.get("cluster_behavior_labels"),
                 binary_results=binary_results_for_report,

@@ -52,7 +52,7 @@ analyses:
   # Frame-level kinematic profile per annotation label (all 3 levels)
   annotation_kinematics: true
 
-  # 128D embedding dims × kinematic metrics (segment-level Spearman)
+  # 128D embedding dims × frame-level kinematic metrics (Spearman)
   embedding_kinematics: true
 
   # V-record vs non-V kinematic comparison (subset of kinematic_profiles)
@@ -145,6 +145,20 @@ statistics:
 
   # Clusters with fewer total frames than this threshold are flagged in reports
   min_frames_per_cluster: 100
+
+  # Frame-level kinematic profiling: minimum non-missing ratio required
+  # per metric within each cluster. Metrics below this are excluded.
+  min_valid_ratio_per_metric: 0.6
+
+  # Tukey fence factor for robust skewness/kurtosis (larger = less aggressive).
+  tukey_fence_k: 3.0
+
+  # Maximum number of frame samples retained per cluster for Kruskal-Wallis.
+  kruskal_max_samples_per_cluster: 5000
+
+  # Optional cap on the number of common frame rows used in embedding × kinematics.
+  # Set to null to use all common frames (current default behavior).
+  embedding_max_common_frames: null
 
   # Significance testing parameters
   significance:
