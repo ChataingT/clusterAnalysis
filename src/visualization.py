@@ -273,17 +273,31 @@ def plot_annotation_centroid_distance(
 
 # ── Clinical volcano plot ─────────────────────────────────────────────────────
 
+_EFFECT_LABELS = {
+    "cohens_d": "Cohen's d",
+    "rank_biserial_r": "rank-biserial r",
+}
+
+
 def plot_clinical_volcano(
     binary_results: pd.DataFrame,
     group_col: str,
     groups: tuple[str, str],
     output_dir: Path,
     alpha: float = 0.05,
+    effect_col: str = "cohens_d",
     formats: list[str] = ("png", "pdf"),
     dpi: int = 300,
 ) -> None:
-    """Volcano plot: Cohen's d vs -log10(p_fdr), colored by direction."""
+    """Volcano plot: effect size vs -log10(p_fdr), colored by direction.
+
+    effect_col selects the x-axis effect size: "cohens_d" (default) or
+    "rank_biserial_r".
+    """
     if binary_results.empty:
+        return
+    if effect_col not in binary_results.columns:
+        logger.warning("plot_clinical_volcano: column '%s' not found, skipping", effect_col)
         return
 
     df = binary_results.copy()
@@ -292,14 +306,17 @@ def plot_clinical_volcano(
     higher_a = df["direction"].str.contains(groups[0], na=False)
     higher_b = df["direction"].str.contains(groups[1], na=False)
 
+    xlabel = _EFFECT_LABELS.get(effect_col, effect_col)
+    stem_suffix = "rbr" if effect_col == "rank_biserial_r" else "cohens_d"
+
     fig, ax = plt.subplots(figsize=(9, 6))
-    ax.scatter(df.loc[~higher_a & ~higher_b, "cohens_d"],
+    ax.scatter(df.loc[~higher_a & ~higher_b, effect_col],
                df.loc[~higher_a & ~higher_b, "-log10_p"],
                color="lightgrey", s=20, alpha=0.7, label="Not significant")
-    ax.scatter(df.loc[higher_a & (df["p_fdr"] < alpha), "cohens_d"],
+    ax.scatter(df.loc[higher_a & (df["p_fdr"] < alpha), effect_col],
                df.loc[higher_a & (df["p_fdr"] < alpha), "-log10_p"],
                color=PALETTE.get(groups[0], "red"), s=30, label=f"Higher in {groups[0]}")
-    ax.scatter(df.loc[higher_b & (df["p_fdr"] < alpha), "cohens_d"],
+    ax.scatter(df.loc[higher_b & (df["p_fdr"] < alpha), effect_col],
                df.loc[higher_b & (df["p_fdr"] < alpha), "-log10_p"],
                color=PALETTE.get(groups[1], "blue"), s=30, label=f"Higher in {groups[1]}")
 
@@ -307,12 +324,12 @@ def plot_clinical_volcano(
                label=f"FDR={alpha}")
     ax.axvline(0, color="black", lw=0.5, alpha=0.5)
 
-    ax.set_xlabel("Cohen's d (effect size)")
+    ax.set_xlabel(f"{xlabel} (effect size)")
     ax.set_ylabel("-log₁₀(p_fdr)")
     ax.set_title(f"Cluster prevalence: {groups[0]} vs {groups[1]}\n(Mann-Whitney U, BH-FDR)")
     ax.legend(framealpha=0.9)
     fig.tight_layout()
-    _save_fig(fig, output_dir, f"clinical_volcano_{group_col}", formats, dpi)
+    _save_fig(fig, output_dir, f"clinical_volcano_{group_col}_{stem_suffix}", formats, dpi)
 
 
 # ── Clinical correlation heatmap ──────────────────────────────────────────────
@@ -400,20 +417,32 @@ def plot_clinical_violin(
     groups: tuple[str, str],
     output_dir: Path,
     top_n: int = 10,
+    effect_col: str = "cohens_d",
     formats: list[str] = ("png", "pdf"),
     dpi: int = 300,
 ) -> None:
-    """Violin plots for top-N most discriminative clusters (ASD vs TD)."""
+    """Violin plots for top-N most discriminative clusters (ASD vs TD).
+
+    effect_col selects the effect size used to rank and annotate clusters:
+    "cohens_d" (default) or "rank_biserial_r".
+    """
     if binary_results.empty:
         return
+    if effect_col not in binary_results.columns:
+        logger.warning("plot_clinical_violin: column '%s' not found, skipping", effect_col)
+        return
+
+    effect_label = _EFFECT_LABELS.get(effect_col, effect_col)
+    effect_short = "r" if effect_col == "rank_biserial_r" else "d"
+    stem_suffix = "rbr" if effect_col == "rank_biserial_r" else "cohens_d"
 
     top_clusters = (
         binary_results[binary_results["significant"]]
-        .nlargest(top_n, "cohens_d")["cluster_id"]
+        .nlargest(top_n, effect_col)["cluster_id"]
         .tolist()
     )
     if not top_clusters:
-        top_clusters = binary_results.nlargest(min(top_n, len(binary_results)), "cohens_d")["cluster_id"].tolist()
+        top_clusters = binary_results.nlargest(min(top_n, len(binary_results)), effect_col)["cluster_id"].tolist()
 
     common_uuids = prevalence_matrix.index.intersection(clinical_df.index)
     prev = prevalence_matrix.loc[common_uuids]
@@ -436,25 +465,27 @@ def plot_clinical_violin(
             palette=PALETTE,
             ax=ax, inner="box", cut=0,
         )
-        # Annotate with effect size
         row = binary_results[binary_results["cluster_id"] == cluster_id]
         if len(row) > 0:
-            d = row.iloc[0]["cohens_d"]
+            eff = row.iloc[0][effect_col]
             p = row.iloc[0]["p_fdr"]
-            ax.set_title(f"Cluster {cluster_id}\nd={d:.2f}, p_fdr={p:.3f}", fontsize=9)
+            ax.set_title(f"Cluster {cluster_id}\n{effect_short}={eff:.2f}, p_fdr={p:.3f}", fontsize=9)
         else:
             ax.set_title(f"Cluster {cluster_id}")
         ax.set_xlabel("")
         ax.set_ylabel("Prevalence" if ax_idx % ncols == 0 else "")
         ax.tick_params(labelsize=8)
 
-    # Hide unused axes
     for ax in axes[len(top_clusters):]:
         ax.set_visible(False)
 
-    fig.suptitle(f"Top discriminative clusters: {groups[0]} vs {groups[1]}", y=1.01)
+    fig.suptitle(
+        f"Top discriminative clusters: {groups[0]} vs {groups[1]}"
+        f" (ranked by {effect_label})",
+        y=1.01,
+    )
     fig.tight_layout()
-    _save_fig(fig, output_dir, f"clinical_top_clusters_violin_{group_col}", formats, dpi)
+    _save_fig(fig, output_dir, f"clinical_top_clusters_violin_{group_col}_{stem_suffix}", formats, dpi)
 
 
 # ── Kinematic heatmap ─────────────────────────────────────────────────────────

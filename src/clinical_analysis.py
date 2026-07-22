@@ -86,7 +86,7 @@ def run_binary_analysis(
     Returns
     -------
     pd.DataFrame with columns:
-        cluster_id, U, p_raw, p_fdr, cohens_d, direction,
+        cluster_id, U, p_raw, p_fdr, cohens_d, rank_biserial_r, direction,
         n_a, n_b, significant, sig_label
     """
     if group_column not in clinical_df.columns:
@@ -129,6 +129,7 @@ def run_binary_analysis(
             "U": res.U,
             "p_raw": res.p_value,
             "cohens_d": res.cohens_d,
+            "rank_biserial_r": res.rank_biserial_r,
             "direction": res.direction,
             "n_a": res.n_a,
             "n_b": res.n_b,

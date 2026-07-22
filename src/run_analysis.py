@@ -285,6 +285,7 @@ def _synthesize_cluster_profiles(
             group = key.replace("binary_", "")
             row[f"{group}_p_fdr"] = float(r.get("p_fdr", float("nan")))
             row[f"{group}_cohens_d"] = float(r.get("cohens_d", float("nan")))
+            row[f"{group}_rank_biserial_r"] = float(r.get("rank_biserial_r", float("nan")))
             row[f"{group}_direction"] = str(r.get("direction", ""))
             row[f"{group}_significant"] = bool(r.get("significant", False))
 
@@ -811,17 +812,21 @@ def main(argv: list[str] | None = None) -> int:
                             group_col = key.replace("binary_", "")
                             unique_vals = clinical_df[group_col].dropna().unique() if group_col in clinical_df.columns else []
                             groups = tuple(sorted(unique_vals))[:2] if len(unique_vals) == 2 else ("A", "B")
-                            plot_clinical_volcano(
-                                df, group_col, groups, output_dir,
-                                alpha=cfg.statistics.alpha,
-                                formats=cfg.output.plot_formats, dpi=cfg.output.figure_dpi,
-                            )
-                            if not prevalence_matrix.empty:
-                                plot_clinical_violin(
-                                    prevalence_matrix, clinical_df, df,
-                                    group_col, groups, output_dir,
+                            for effect_col in ("cohens_d", "rank_biserial_r"):
+                                plot_clinical_volcano(
+                                    df, group_col, groups, output_dir,
+                                    alpha=cfg.statistics.alpha,
+                                    effect_col=effect_col,
                                     formats=cfg.output.plot_formats, dpi=cfg.output.figure_dpi,
                                 )
+                            if not prevalence_matrix.empty:
+                                for effect_col in ("cohens_d", "rank_biserial_r"):
+                                    plot_clinical_violin(
+                                        prevalence_matrix, clinical_df, df,
+                                        group_col, groups, output_dir,
+                                        effect_col=effect_col,
+                                        formats=cfg.output.plot_formats, dpi=cfg.output.figure_dpi,
+                                    )
                     if "continuous" in clinical_results:
                         plot_clinical_correlation_heatmap(
                             clinical_results["continuous"], output_dir,

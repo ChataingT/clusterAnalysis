@@ -28,6 +28,7 @@ class MannWhitneyResult(NamedTuple):
     U: float
     p_value: float
     cohens_d: float
+    rank_biserial_r: float  # r = 1 - 2U / (n_a * n_b), range [-1, 1]
     direction: str    # "higher_in_group_a" | "higher_in_group_b" | "equal"
     n_a: int
     n_b: int
@@ -50,7 +51,7 @@ def mann_whitney_with_effect(
     label_b: str = "B",
 ) -> MannWhitneyResult:
     """
-    Mann-Whitney U test with Cohen's d effect size.
+    Mann-Whitney U test with Cohen's d and rank-biserial correlation effect sizes.
 
     Parameters
     ----------
@@ -62,6 +63,9 @@ def mann_whitney_with_effect(
     Returns
     -------
     MannWhitneyResult
+        Includes rank_biserial_r = 1 - 2U / (n_a * n_b), the non-parametric
+        effect size naturally paired with the Mann-Whitney U statistic.
+        Range [-1, 1]; positive means group_a tends to be larger.
     """
     a = np.asarray(group_a, dtype=float)
     b = np.asarray(group_b, dtype=float)
@@ -84,7 +88,7 @@ def mann_whitney_with_effect(
     if len(a) == 0 or len(b) == 0:
         return MannWhitneyResult(
             U=float("nan"), p_value=float("nan"), cohens_d=float("nan"),
-            direction="undefined", n_a=len(a), n_b=len(b)
+            rank_biserial_r=float("nan"), direction="undefined", n_a=len(a), n_b=len(b)
         )
 
     U, p = mannwhitneyu(a, b, alternative="two-sided")
@@ -100,6 +104,9 @@ def mann_whitney_with_effect(
     else:
         d = 0.0
 
+    # Rank-biserial correlation (non-parametric effect size for Mann-Whitney)
+    r = 1.0 - (2.0 * U) / (len(a) * len(b))
+
     if a.mean() > b.mean():
         direction = f"higher_in_{label_a}"
     elif b.mean() > a.mean():
@@ -107,8 +114,8 @@ def mann_whitney_with_effect(
     else:
         direction = "equal"
 
-    return MannWhitneyResult(U=U, p_value=p, cohens_d=d, direction=direction,
-                              n_a=len(a), n_b=len(b))
+    return MannWhitneyResult(U=U, p_value=p, cohens_d=d, rank_biserial_r=float(r),
+                              direction=direction, n_a=len(a), n_b=len(b))
 
 
 # ── Spearman correlation ──────────────────────────────────────────────────────
